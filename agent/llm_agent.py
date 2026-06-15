@@ -4,12 +4,22 @@ llm_agent.py
 LLM interface layer: Claude Vision perception + Claude dialogue management.
 When ANTHROPIC_API_KEY is not set, both functions fall back to simple rules
 so the rest of the pipeline keeps running without modification.
+
+Environment variables (follow the mimo pattern in ~/.zshrc):
+  ANTHROPIC_API_KEY      – API key (required for LLM features)
+  ANTHROPIC_BASE_URL     – custom base URL, e.g. https://api.xiaomimimo.com/anthropic
+  VLN_PERCEIVE_MODEL     – model used for visual perception (default: claude-sonnet-4-6)
+  VLN_DIALOGUE_MODEL     – model used for goal parsing / replies (default: claude-haiku-4-5-20251001)
 """
 
 import os
 import base64
 import numpy as np
 from typing import Optional
+
+# Model names: override via env to route through any Anthropic-compatible provider
+_MODEL_PERCEIVE = os.environ.get("VLN_PERCEIVE_MODEL",  "claude-sonnet-4-6")
+_MODEL_DIALOGUE = os.environ.get("VLN_DIALOGUE_MODEL",  "claude-haiku-4-5-20251001")
 
 
 # ── API client (lazy-loaded; missing key does not crash the process) ──────────
@@ -20,9 +30,15 @@ def _get_client():
         return None
     try:
         import anthropic
+        # ANTHROPIC_BASE_URL is read automatically by the SDK if set in the environment
         return anthropic.Anthropic(api_key=key)
     except Exception:
         return None
+
+
+def _extract_text(content_blocks) -> str:
+    """Return the first text from a list of content blocks, skipping ThinkingBlocks."""
+    return next((b.text for b in content_blocks if hasattr(b, "text")), "")
 
 
 # ── PERCEIVE ──────────────────────────────────────────────────────────────────
@@ -44,8 +60,8 @@ def perceive(frame: np.ndarray, goal: str) -> dict:
         img_b64 = _frame_to_b64(frame)
         # Prompt is in Chinese to match the robot's conversational language
         response = client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=256,
+            model=_MODEL_PERCEIVE,
+            max_tokens=512,
             messages=[{
                 "role": "user",
                 "content": [
@@ -74,7 +90,7 @@ def perceive(frame: np.ndarray, goal: str) -> dict:
             }],
         )
         import json
-        text  = response.content[0].text.strip()
+        text  = _extract_text(response.content).strip()
         start = text.find("{")
         end   = text.rfind("}") + 1
         return json.loads(text[start:end])
@@ -127,8 +143,8 @@ class DialogueAgent:
         if client is not None:
             try:
                 resp = client.messages.create(
-                    model="claude-haiku-4-5-20251001",
-                    max_tokens=64,
+                    model=_MODEL_DIALOGUE,
+                    max_tokens=128,
                     messages=[{
                         "role": "user",
                         "content": (
@@ -137,7 +153,7 @@ class DialogueAgent:
                         ),
                     }],
                 )
-                goal = resp.content[0].text.strip()
+                goal = _extract_text(resp.content).strip()
                 if goal:
                     return goal
             except Exception:
@@ -157,14 +173,14 @@ class DialogueAgent:
         if client is not None:
             try:
                 resp = client.messages.create(
-                    model="claude-haiku-4-5-20251001",
-                    max_tokens=64,
+                    model=_MODEL_DIALOGUE,
+                    max_tokens=128,
                     messages=[{
                         "role": "user",
                         "content": "你是家居机器人，刚刚完成导航到达目标位置，用一句简短的中文询问用户还需要什么帮助。",
                     }],
                 )
-                return resp.content[0].text.strip()
+                return _extract_text(resp.content).strip()
             except Exception:
                 pass
         return "我已到达，还需要什么？"
