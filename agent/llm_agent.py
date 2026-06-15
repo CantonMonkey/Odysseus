@@ -132,6 +132,11 @@ class DialogueAgent:
         "冰箱": "冰箱", "refrigerator": "冰箱",
         "镜子": "镜子", "mirror": "镜子",
         "电视": "电视", "tv": "电视",
+        "衣柜": "衣柜", "wardrobe": "衣柜", "柜子": "柜子",
+        "书架": "书架", "bookshelf": "书架",
+        "床头柜": "床头柜", "nightstand": "床头柜",
+        "台灯": "台灯", "lamp": "台灯",
+        "浴缸": "浴缸", "bathtub": "浴缸",
     }
 
     def __init__(self):

@@ -31,7 +31,10 @@ def _nearest_reachable(env, candidates: list) -> Optional[list]:
     best_target = None
 
     for cand in candidates:
-        tgt     = np.array(cand, dtype=np.float32)
+        tgt = np.array(cand, dtype=np.float32)
+        # Skip objects on a different floor (>2 m Y difference from robot)
+        if abs(tgt[1] - robot_pos[1]) > 2.0:
+            continue
         snapped = pf.snap_point(tgt)
         if np.any(np.isnan(snapped)):
             continue

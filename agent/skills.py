@@ -157,17 +157,17 @@ def _replan(env, robot_pos: np.ndarray, target_pos) -> list:
 # forward to a new vantage point, repeating until LLM perception fires.
 
 def search_room(env, nav_state: dict) -> dict:
-    """Rotate in place (and occasionally step) waiting for LLM guidance."""
-    from agent.habitat_env import ACTION_LEFT, ACTION_FORWARD
+    """Rotate in place waiting for LLM guidance.
+
+    Forward movement is intentionally omitted: random walking can bring
+    the robot to stairwells or other bad positions, distorting the camera
+    view and making LLM perception unreliable.
+    """
+    from agent.habitat_env import ACTION_LEFT
 
     rotated = nav_state.get("search_rotated", 0.0)
-
-    if rotated >= 360.0:
-        frame, _ = env.step(ACTION_FORWARD)
-        nav_state["search_rotated"] = 0.0
-    else:
-        frame, _ = env.step(ACTION_LEFT)
-        nav_state["search_rotated"] = rotated + 15.0
+    frame, _ = env.step(ACTION_LEFT)
+    nav_state["search_rotated"] = (rotated + 15.0) % 360.0
 
     nav_state["last_frame"]  = frame
     nav_state["step_count"] += 1

@@ -25,9 +25,14 @@ CHINESE_TO_CATEGORY = {
     "门":   ["door"],
     "窗户": ["window"],
     "电视": ["tv", "led tv", "television"],
-    "柜子": ["cabinet", "wardrobe", "dresser"],
+    "柜子": ["cabinet", "wardrobe", "dresser", "chest of drawers"],
+    "衣柜": ["wardrobe", "cabinet", "dresser", "chest of drawers"],
+    "书架": ["shelf", "bookshelf", "shelving"],
+    "床头柜": ["nightstand", "bedside table", "side table"],
     "冰箱": ["refrigerator", "fridge"],
     "镜子": ["mirror"],
+    "台灯": ["lamp", "table lamp", "floor lamp"],
+    "浴缸": ["bathtub", "tub"],
 }
 
 # Background / structural categories to exclude from the object index
