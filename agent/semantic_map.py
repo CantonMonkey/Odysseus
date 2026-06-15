@@ -1,7 +1,11 @@
 """
 semantic_map.py
-通过解析 HM3D semantic.glb vertex colors，构建场景物体 3D 坐标索引。
-semantic.txt 提供 color->category 映射，semantic.glb 的顶点颜色直接对应语义类别。
+
+Builds a 3D object coordinate index for an HM3D scene by parsing vertex colors
+from <scene>.semantic.glb.  The companion <scene>.semantic.txt maps each RGB
+color to a category name; vertex colors in the GLB encode semantic labels
+directly, bypassing Habitat's built-in semantic sensor (which requires
+scene-instance JSON files not shipped with the minival split).
 """
 
 import trimesh
@@ -10,7 +14,7 @@ from pathlib import Path
 from collections import defaultdict
 import json
 
-# 中文指令 -> HM3D 语义类别映射
+# Chinese instruction keyword → HM3D semantic category list
 CHINESE_TO_CATEGORY = {
     "沙发": ["sofa", "couch", "armchair"],
     "床":   ["bed"],
@@ -26,7 +30,7 @@ CHINESE_TO_CATEGORY = {
     "镜子": ["mirror"],
 }
 
-# 不感兴趣的背景类别（过滤掉）
+# Background / structural categories to exclude from the object index
 IGNORE_CATEGORIES = {
     "wall", "floor", "ceiling", "unknown", "door frame", "window frame",
     "wall hanging decoration", "stairs", "vent", "ventilation",
@@ -36,12 +40,12 @@ DATA_DIR = Path("/data3/liangjy/vln/data/hm3d")
 
 
 def _parse_semantic_txt(scene_dir: Path) -> dict:
-    """返回 {(r,g,b): category_name}"""
+    """Parse <scene>.semantic.txt and return {(r, g, b): category_name}."""
     scene_id = scene_dir.name.split("-", 1)[1]
     txt_path = scene_dir / f"{scene_id}.semantic.txt"
     color_to_cat = {}
     with open(txt_path) as f:
-        next(f)
+        next(f)  # skip header
         for line in f:
             parts = line.strip().split(",", 3)
             if len(parts) >= 3:
@@ -56,9 +60,12 @@ def _parse_semantic_txt(scene_dir: Path) -> dict:
 
 def build_semantic_map(scene_dir: str, cache: bool = True) -> dict:
     """
-    解析 semantic.glb vertex colors，返回 {category: [[x,y,z], ...]} 物体坐标表。
-    每个坐标是该类别某个实例的近似中心点。
-    结果缓存到 scene_dir/semantic_cache.json。
+    Parse vertex colors from <scene>.semantic.glb and return a dict
+    {category: [[x, y, z], ...]} where each entry is the centroid of one
+    0.5 m grid cell occupied by that category.
+
+    Results are cached in scene_dir/semantic_cache.json to avoid re-parsing
+    the GLB on every run.
     """
     scene_dir = Path(scene_dir)
     cache_path = scene_dir / "semantic_cache.json"
@@ -73,39 +80,34 @@ def build_semantic_map(scene_dir: str, cache: bool = True) -> dict:
 
     color_to_cat = _parse_semantic_txt(scene_dir)
 
-    # 加载 semantic.glb，提取所有顶点颜色和坐标
     glb_scene = trimesh.load(str(sem_glb_path), force="scene")
 
-    # 按类别聚合顶点坐标
-    cat_vertices = defaultdict(list)
+    cat_vertices: dict = defaultdict(list)
 
-    for key, mesh in glb_scene.geometry.items():
+    for _key, mesh in glb_scene.geometry.items():
         try:
-            vc = mesh.visual.to_color().vertex_colors[:, :3]  # (N, 3) RGB
-            verts = mesh.vertices  # (N, 3) xyz
+            vc = mesh.visual.to_color().vertex_colors[:, :3]  # (N, 3) RGB uint8
+            verts = mesh.vertices                              # (N, 3) XYZ float
         except Exception:
             continue
 
-        # 对每个顶点查找类别
         for i in range(len(verts)):
             c = (int(vc[i, 0]), int(vc[i, 1]), int(vc[i, 2]))
             cat = color_to_cat.get(c)
             if cat and cat not in IGNORE_CATEGORIES:
                 cat_vertices[cat].append(verts[i].tolist())
 
-    # 对每个类别，做简单聚类：合并距离很近的顶点群（>0.5m 分开）
-    # 用均值量化：把同一类别的顶点按 0.5m 格子分组，取每组中心
+    # Cluster vertices per category using a 0.5 m voxel grid; store cell centroids
     result = {}
     for cat, verts in cat_vertices.items():
         arr = np.array(verts)
-        # 量化到 0.5m 格子
         quantized = np.round(arr / 0.5).astype(int)
         unique_cells = np.unique(quantized, axis=0)
         centers = []
         for cell in unique_cells:
             mask = np.all(quantized == cell, axis=1)
             center = arr[mask].mean(axis=0).tolist()
-            centers.append([round(c, 3) for c in center])
+            centers.append([round(v, 3) for v in center])
         result[cat] = centers
 
     if cache:
@@ -117,7 +119,7 @@ def build_semantic_map(scene_dir: str, cache: bool = True) -> dict:
 
 
 def query_target(scene_dir: str, chinese_target: str) -> list:
-    """根据中文目标词，返回场景中对应物体的 3D 坐标列表。"""
+    """Return a list of 3D positions for a Chinese target word (e.g. '沙发')."""
     sem_map = build_semantic_map(scene_dir)
     categories = CHINESE_TO_CATEGORY.get(chinese_target, [chinese_target.lower()])
     results = []
@@ -127,7 +129,7 @@ def query_target(scene_dir: str, chinese_target: str) -> list:
 
 
 def nearest_target(robot_pos: list, positions: list):
-    """从候选坐标列表中返回距离机器人最近的一个。"""
+    """Return the position in *positions* closest to *robot_pos* (Euclidean)."""
     if not positions:
         return None
     robot = np.array(robot_pos)
@@ -141,13 +143,13 @@ if __name__ == "__main__":
 
     sem_map = build_semantic_map(scene, cache=True)
 
-    print(f"\n=== 场景物体类别（共 {len(sem_map)} 类）===")
+    print(f"\n=== Scene categories ({len(sem_map)} total) ===")
     for cat, positions in sorted(sem_map.items()):
-        print(f"  {cat}: {len(positions)} 个实例")
+        print(f"  {cat}: {len(positions)} instance(s)")
 
-    print("\n=== 目标查询测试 ===")
+    print("\n=== Target query test ===")
     for target in ["沙发", "床", "椅子", "桌子", "厕所", "镜子"]:
         positions = query_target(scene, target)
-        print(f"  {target}: {len(positions)} 个位置")
+        print(f"  {target}: {len(positions)} position(s)")
         if positions:
-            print(f"    坐标示例: {positions[0]}")
+            print(f"    example: {positions[0]}")

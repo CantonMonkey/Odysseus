@@ -1,7 +1,9 @@
 """
 habitat_env.py
-Habitat-Sim 0.3.1 headless EGL 环境封装。
-加载 HM3D .basis.glb 场景，提供 step/observe/get_frame 接口供控制循环调用。
+
+Thin Habitat-Sim 0.3.1 wrapper for headless EGL rendering.
+Loads an HM3D .basis.glb scene and exposes step / get_frame / get_robot_pose
+for the control loop to call.
 """
 
 import os
@@ -9,24 +11,24 @@ import numpy as np
 from pathlib import Path
 from typing import Optional, Tuple
 
-# 强制无显示（EGL headless）
+# Suppress X11 display lookup so EGL headless init succeeds
 os.environ.setdefault("DISPLAY", "")
 
 import habitat_sim
 from habitat_sim import SensorType
 
-# 动作常量
+# Action name constants
 ACTION_FORWARD = "move_forward"
 ACTION_LEFT    = "turn_left"
 ACTION_RIGHT   = "turn_right"
 ACTION_STOP    = "stop"
 
-# 传感器参数
-IMG_H = 480
-IMG_W = 640
-EYE_HEIGHT = 1.0    # 轮式机器人摄像头高度（m）
-FORWARD_STEP = 0.25  # 每步前进距离（m）
-TURN_DEG = 15.0      # 每步转向角度（度）
+# Sensor / motion parameters
+IMG_H        = 480
+IMG_W        = 640
+EYE_HEIGHT   = 1.0   # camera height on a wheeled robot (m)
+FORWARD_STEP = 0.25  # distance per move_forward step (m)
+TURN_DEG     = 15.0  # degrees per turn step
 
 DATA_DIR = Path("/data3/liangjy/vln/data/hm3d")
 
@@ -69,9 +71,10 @@ def _make_config(scene_glb: str, gpu_id: int = 0) -> habitat_sim.Configuration:
 
 class HabitatEnv:
     """
-    轻量 Habitat-Sim 封装，供控制循环调用。
-    reset() 加载场景并初始化机器人位置。
-    step(action) 执行一步并返回 RGB 帧。
+    Lightweight Habitat-Sim wrapper used by the control loop.
+
+    reset()  – load (or reload) scene, place agent on the navmesh.
+    step()   – execute one action, return (rgb_frame, done).
     """
 
     def __init__(self, gpu_id: int = 0):
@@ -86,9 +89,10 @@ class HabitatEnv:
         start_pos: Optional[list] = None,
     ) -> np.ndarray:
         """
-        加载（或重置）场景，返回初始 RGB 帧。
-        scene_dir: 场景目录路径，如 /data3/.../00800-TEEsavR23oF
-        start_pos: [x, y, z] 初始位置；None 表示随机放置在 navmesh 上
+        Load or reload a scene and return the initial RGB frame.
+
+        scene_dir  – path to the HM3D scene directory (e.g. .../00800-TEEsavR23oF)
+        start_pos  – [x, y, z] spawn position; None → random navigable point
         """
         if scene_dir is None:
             scene_dir = str(DATA_DIR / "00800-TEEsavR23oF")
@@ -98,7 +102,7 @@ class HabitatEnv:
         glb = str(scene_path / f"{scene_id}.basis.glb")
 
         if self._sim is not None and self._scene_glb == glb:
-            # 同场景重置：不重建仿真器
+            # Same scene: reset without rebuilding the simulator
             self._sim.reset()
         else:
             if self._sim is not None:
@@ -123,10 +127,7 @@ class HabitatEnv:
         return self._obs()
 
     def step(self, action: str) -> Tuple[np.ndarray, bool]:
-        """
-        执行动作，返回 (rgb_frame, done)。
-        action 为 ACTION_* 常量之一。
-        """
+        """Execute *action* (one of ACTION_*) and return (rgb_frame, done)."""
         if action == ACTION_STOP:
             self.done = True
             return self._obs(), True
@@ -135,20 +136,22 @@ class HabitatEnv:
         return self._obs(), False
 
     def get_frame(self) -> np.ndarray:
-        """返回当前 RGB 帧 (H, W, 3) uint8。"""
+        """Return the current RGB frame as (H, W, 3) uint8."""
         return self._obs()
 
     def get_robot_pose(self) -> Tuple[np.ndarray, float]:
-        """返回 (position_xyz, heading_degrees)。heading=0 朝 +Z，顺时针为正。"""
+        """Return (position_xyz, heading_degrees).
+
+        heading=0 → facing -Z (default); increases counter-clockwise with turn_left.
+        """
         state = self._sim.get_agent(0).get_state()
         pos = state.position  # np.ndarray [x, y, z]
-        q = state.rotation    # quaternion
-        # 从四元数提取 yaw（绕 Y 轴旋转）
+        q = state.rotation
         heading = _quat_to_heading(q)
         return pos, heading
 
     def navigable_point_near(self, target_pos: list, radius: float = 1.0) -> Optional[np.ndarray]:
-        """在目标周围找到最近的可导航点。"""
+        """Snap *target_pos* to the nearest point on the navmesh."""
         pf = self._sim.pathfinder
         if not pf.is_loaded:
             return None
@@ -158,7 +161,7 @@ class HabitatEnv:
         return p
 
     def distance_to(self, target_pos: list) -> float:
-        """机器人到目标的路径距离（走 navmesh 最短路）。"""
+        """Geodesic (navmesh shortest-path) distance to *target_pos*."""
         pos, _ = self.get_robot_pose()
         path = habitat_sim.ShortestPath()
         path.requested_start = pos
@@ -174,26 +177,23 @@ class HabitatEnv:
     def _obs(self) -> np.ndarray:
         obs = self._sim.get_sensor_observations()
         rgba = obs["color"]       # (H, W, 4) uint8
-        return rgba[:, :, :3]     # drop alpha
+        return rgba[:, :, :3]    # drop alpha channel
 
 
 def _quat_to_heading(q) -> float:
-    """将 habitat quaternion 转换为 heading（度）。"""
-    # habitat quaternion: (w, x, y, z) via numpy-quaternion or similar
-    # yaw = atan2(2*(w*y + x*z), 1 - 2*(y^2 + z^2))
+    """Convert a Habitat quaternion to a heading angle in degrees."""
     try:
         import quaternion as npq
         angles = npq.as_euler_angles(q)
         yaw_rad = float(angles[1])
     except Exception:
-        # fallback: extract from rotation matrix
+        # Fallback: extract yaw from quaternion components directly
         w, x, y, z = float(q.w), float(q.x), float(q.y), float(q.z)
         yaw_rad = np.arctan2(2 * (w * y + x * z), 1 - 2 * (y * y + z * z))
     return float(np.degrees(yaw_rad))
 
 
 if __name__ == "__main__":
-    import sys
     import imageio
 
     scene = str(DATA_DIR / "00800-TEEsavR23oF")
@@ -206,12 +206,9 @@ if __name__ == "__main__":
     pos, heading = env.get_robot_pose()
     print(f"Initial pose: pos={pos.round(3)}, heading={heading:.1f}°")
 
-    # 保存初始帧
-    out = "/tmp/habitat_step000.png"
-    imageio.imwrite(out, frame)
-    print(f"Saved: {out}")
+    imageio.imwrite("/tmp/habitat_step000.png", frame)
+    print("Saved: /tmp/habitat_step000.png")
 
-    # 执行几步动作
     actions = [ACTION_FORWARD, ACTION_FORWARD, ACTION_LEFT, ACTION_FORWARD,
                ACTION_RIGHT, ACTION_FORWARD, ACTION_FORWARD]
     for i, act in enumerate(actions, 1):

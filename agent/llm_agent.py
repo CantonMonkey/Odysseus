@@ -1,7 +1,9 @@
 """
 llm_agent.py
-LLM 接口层：Claude Vision 感知 + Claude 对话管理。
-API key 未到位时自动 fallback 到规则实现，主流程不变。
+
+LLM interface layer: Claude Vision perception + Claude dialogue management.
+When ANTHROPIC_API_KEY is not set, both functions fall back to simple rules
+so the rest of the pipeline keeps running without modification.
 """
 
 import os
@@ -9,7 +11,8 @@ import base64
 import numpy as np
 from typing import Optional
 
-# ── API 客户端（懒加载，key 缺失时不崩溃）──────────────────────
+
+# ── API client (lazy-loaded; missing key does not crash the process) ──────────
 
 def _get_client():
     key = os.environ.get("ANTHROPIC_API_KEY", "")
@@ -22,15 +25,16 @@ def _get_client():
         return None
 
 
-# ── 感知（PERCEIVE）──────────────────────────────────────────────
+# ── PERCEIVE ──────────────────────────────────────────────────────────────────
 
 def perceive(frame: np.ndarray, goal: str) -> dict:
-    """
-    用 Claude Vision 分析当前 RGB 帧，判断目标是否可见。
-    返回 {"target_visible": bool, "direction": str, "distance": float}
+    """Analyse the current RGB frame with Claude Vision.
 
-    key 未到位时用规则 fallback（始终返回 target_visible=False，
-    控制循环会全程依赖 semantic_map 导航）。
+    Returns {"target_visible": bool, "direction": str, "distance": float}.
+
+    Without an API key the rule fallback always returns target_visible=False,
+    meaning the control loop relies entirely on the semantic-map coordinates
+    for navigation.
     """
     client = _get_client()
     if client is None:
@@ -38,6 +42,7 @@ def perceive(frame: np.ndarray, goal: str) -> dict:
 
     try:
         img_b64 = _frame_to_b64(frame)
+        # Prompt is in Chinese to match the robot's conversational language
         response = client.messages.create(
             model="claude-sonnet-4-6",
             max_tokens=256,
@@ -69,22 +74,21 @@ def perceive(frame: np.ndarray, goal: str) -> dict:
             }],
         )
         import json
-        text = response.content[0].text.strip()
-        # 提取 JSON 部分
+        text  = response.content[0].text.strip()
         start = text.find("{")
-        end = text.rfind("}") + 1
+        end   = text.rfind("}") + 1
         return json.loads(text[start:end])
     except Exception:
         return _perceive_rule(frame, goal)
 
 
 def _perceive_rule(frame: np.ndarray, goal: str) -> dict:
-    """规则 fallback：无 LLM 时返回 not visible，依赖 semantic_map 坐标导航。"""
+    """Rule-based fallback: report target not visible, trust semantic-map nav."""
     return {"target_visible": False, "direction": "not_visible", "distance": 99.0}
 
 
 def _frame_to_b64(frame: np.ndarray) -> str:
-    """RGB uint8 numpy array → JPEG base64 string。"""
+    """Encode an RGB uint8 numpy array as a JPEG base64 string."""
     import io
     from PIL import Image
     img = Image.fromarray(frame.astype(np.uint8))
@@ -93,20 +97,19 @@ def _frame_to_b64(frame: np.ndarray) -> str:
     return base64.b64encode(buf.getvalue()).decode()
 
 
-# ── 对话管理（DIALOGUE）─────────────────────────────────────────
+# ── DIALOGUE ──────────────────────────────────────────────────────────────────
 
 class DialogueAgent:
-    """
-    管理与用户的对话：
-    - 解析中文目标指令 → 目标词
-    - 到达后回复"还需要什么"
-    - key 未到位时用简单规则解析
+    """Manage user dialogue: parse Chinese goal instructions and compose replies.
+
+    With an API key: uses Claude Haiku for intent extraction and reply generation.
+    Without a key:   falls back to keyword matching for goal parsing.
     """
 
-    # 已知中文指令关键词 → 目标词（供规则 fallback）
+    # Keyword → canonical goal word (used by the rule-based fallback)
     _KEYWORD_MAP = {
         "沙发": "沙发", "sofa": "沙发", "couch": "沙发",
-        "床": "床", "bed": "床",
+        "床":   "床",   "bed":  "床",
         "椅子": "椅子", "chair": "椅子",
         "桌子": "桌子", "table": "桌子", "desk": "桌子",
         "厕所": "厕所", "toilet": "厕所", "卫生间": "厕所",
@@ -116,11 +119,10 @@ class DialogueAgent:
     }
 
     def __init__(self):
-        self._client = None
         self._history = []
 
     def parse_goal(self, user_input: str) -> Optional[str]:
-        """从用户输入中提取导航目标词。先尝试 LLM，失败用关键词匹配。"""
+        """Extract a navigation goal keyword from a Chinese user utterance."""
         client = _get_client()
         if client is not None:
             try:
@@ -150,7 +152,7 @@ class DialogueAgent:
         return None
 
     def arrival_message(self) -> str:
-        """到达目标后的询问语。"""
+        """Generate a short Chinese reply after the robot reaches the goal."""
         client = _get_client()
         if client is not None:
             try:
