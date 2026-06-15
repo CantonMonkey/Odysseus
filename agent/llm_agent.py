@@ -83,7 +83,10 @@ def perceive(frame: np.ndarray, goal: str) -> dict:
                             f"2. 目标大致方向（direction: left/center/right/not_visible）\n"
                             f"3. 估计距离（distance: 米，不可见时填 99）\n"
                             f"只返回 JSON，格式：{{\"target_visible\": bool, "
-                            f"\"direction\": str, \"distance\": float}}"
+                            f"\"direction\": str, \"distance\": float, "
+                            f"\"confidence\": float}}  "
+                            f"confidence 是 0-1 的浮点数，表示目标在视野中的把握程度，"
+                            f"目标不可见时为 0.0。"
                         ),
                     },
                 ],

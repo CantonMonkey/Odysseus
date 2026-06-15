@@ -47,10 +47,17 @@ def _make_config(scene_glb: str, gpu_id: int = 0) -> habitat_sim.Configuration:
     rgb_spec.position = [0.0, EYE_HEIGHT, 0.0]
     rgb_spec.hfov = 90
 
+    depth_spec = habitat_sim.CameraSensorSpec()
+    depth_spec.uuid = "depth"
+    depth_spec.sensor_type = SensorType.DEPTH
+    depth_spec.resolution = [IMG_H, IMG_W]
+    depth_spec.position = [0.0, EYE_HEIGHT, 0.0]
+    depth_spec.hfov = 90
+
     agent_cfg = habitat_sim.agent.AgentConfiguration()
     agent_cfg.height = 0.88
     agent_cfg.radius = 0.18
-    agent_cfg.sensor_specifications = [rgb_spec]
+    agent_cfg.sensor_specifications = [rgb_spec, depth_spec]
     agent_cfg.action_space = {
         ACTION_FORWARD: habitat_sim.agent.ActionSpec(
             "move_forward",
@@ -138,6 +145,20 @@ class HabitatEnv:
     def get_frame(self) -> np.ndarray:
         """Return the current RGB frame as (H, W, 3) uint8."""
         return self._obs()
+
+    def get_depth(self) -> np.ndarray:
+        """Return the current depth frame as (H, W) float32, metres."""
+        obs = self._sim.get_sensor_observations()
+        return obs["depth"].astype(np.float32)
+
+    def get_rotation_matrix(self) -> np.ndarray:
+        """Return the 3x3 rotation matrix that transforms agent-local to world."""
+        try:
+            import quaternion as npq
+            q = self._sim.get_agent(0).get_state().rotation
+            return npq.as_rotation_matrix(q)
+        except Exception:
+            return np.eye(3)
 
     def get_robot_pose(self) -> Tuple[np.ndarray, float]:
         """Return (position_xyz, heading_degrees).

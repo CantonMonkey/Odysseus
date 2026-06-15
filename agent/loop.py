@@ -1,123 +1,234 @@
 """
-loop.py
+loop.py — VLFM-style online exploration loop.
 
-Inner control loop (Control Loop):
-  observe → perceive → plan → execute → validate
+The robot no longer uses a pre-computed semantic map.  Instead:
+  1. Explore the environment by navigating to frontiers (unexplored boundaries).
+  2. Call the VLM every VLM_CALL_INTERVAL steps to score the current view.
+  3. Accumulate scores in an online value map (ExploreMap).
+  4. When VLM reports target visible with high confidence, estimate its 3D
+     position from depth + viewing direction and switch to follow_path.
+  5. Verify arrival within ARRIVE_DIST of the estimated target.
 
-The outer Task Loop only needs to call run_task(env, task, ...) and block
-until the task completes or times out.
+This satisfies the "only visual info + robot state, no privileged labels"
+requirement from the course specification.
 """
 
 import numpy as np
 import habitat_sim
 from typing import Callable, Optional
 
-from agent.semantic_map import query_target, DATA_DIR
+from agent.explore_map import ExploreMap, VLM_CALL_INTERVAL
 
 MAX_STEPS  = 300
-SCENE_DIR  = str(DATA_DIR / "00800-TEEsavR23oF")
 ARRIVE_DIST = 1.2
+VLM_CONF_THRESHOLD = 0.55   # confidence above this → treat target as found
+
+# Default scene — overridden by server/main.py at startup
+from pathlib import Path
+_DATA = Path("/data3/liangjy/vln/data/hm3d")
+SCENE_DIR = str(_DATA / "00800-TEEsavR23oF")
 
 
-def _nearest_reachable(env, candidates: list) -> Optional[list]:
-    """Return the geodesically closest reachable candidate from *candidates*.
+# ── 3-D target localisation from VLM direction hint ────────────────────────
 
-    Each candidate is snapped to the navmesh first; unreachable candidates
-    (snap returns NaN or pathfinder finds no route) are skipped.
+def _estimate_target_pos(
+    depth_frame: np.ndarray,
+    direction: str,
+    agent_pos: np.ndarray,
+    R: np.ndarray,
+    hfov: float = 90.0,
+) -> Optional[np.ndarray]:
     """
-    pf        = env._sim.pathfinder
-    robot_pos = env.get_robot_pose()[0].astype(np.float32)
-    best_dist = float("inf")
-    best_target = None
+    Convert (direction, depth) to an approximate world-frame 3D position.
 
-    for cand in candidates:
-        tgt = np.array(cand, dtype=np.float32)
-        # Skip objects on a different floor (>2 m Y difference from robot)
-        if abs(tgt[1] - robot_pos[1]) > 2.0:
-            continue
-        snapped = pf.snap_point(tgt)
-        if np.any(np.isnan(snapped)):
-            continue
-        path = habitat_sim.ShortestPath()
-        path.requested_start = robot_pos
-        path.requested_end   = snapped
-        if pf.find_path(path) and path.geodesic_distance < best_dist:
-            best_dist   = path.geodesic_distance
-            best_target = snapped.tolist()
+    direction : "left" | "center" | "right" (from VLM)
+    Returns [x, y, z] in world frame, or None if depth is invalid.
+    """
+    H, W   = depth_frame.shape
+    fx     = W / (2.0 * np.tan(np.radians(hfov / 2.0)))
+    cx, cy = W / 2.0, H / 2.0
 
-    return best_target
+    col = {"left": W // 4, "center": W // 2, "right": 3 * W // 4}.get(
+        direction, W // 2
+    )
+    u, v = col, int(cy)
+
+    # Median depth inside a patch around the hinted column
+    u1, u2 = max(0, u - 30), min(W, u + 30)
+    v1, v2 = max(0, v - 40), min(H, v + 40)
+    patch = depth_frame[v1:v2, u1:u2]
+    valid = patch[(patch > 0.3) & (patch < 7.0)]
+    if len(valid) == 0:
+        return None
+
+    d = float(np.median(valid))
+
+    # Camera-local 3-D point (camera looks along -Z in local frame)
+    x_c = (u - cx) * d / fx
+    y_c = 0.0    # keep at eye level — we care about XZ for navigation
+    z_c = -d
+
+    cam_pos      = agent_pos.copy()
+    cam_pos[1]  += 1.0          # EYE_HEIGHT
+
+    p_world = R @ np.array([x_c, y_c, z_c]) + cam_pos
+    return p_world.astype(np.float32)
 
 
-def _init_nav_state(env, task: str, scene_dir: str) -> dict:
-    candidates = query_target(scene_dir, task)
-    target_pos = _nearest_reachable(env, candidates) if candidates else None
+# ── frontier skill ──────────────────────────────────────────────────────────
 
-    return {
-        "goal":          task,
-        "target_pos":    target_pos,
-        "step_count":    0,
-        "current_skill": "follow_path" if target_pos else "search_room",
-        "done":          False,
-        "last_frame":    None,
-        "last_percept":  {},
-        "waypoints":     [],
-        "search_rotated": 0.0,
-    }
+def _explore_frontier(env, nav_state: dict, explore_map: ExploreMap) -> dict:
+    """
+    Navigate toward the highest-value unexplored frontier.
+    Falls back to slow rotation when no frontiers remain.
+    """
+    from agent.skills import _replan, _get_forward, _turn_to, _euclidean
+    from agent.habitat_env import ACTION_FORWARD, ACTION_LEFT
+    from agent.skills import WP_REACH, ALIGN_THRESH
 
+    robot_pos, _ = env.get_robot_pose()
+
+    # If we've reached the current frontier, clear it so we pick a fresh one
+    f_pos = nav_state.get("frontier_pos")
+    if f_pos is not None and _euclidean(robot_pos, f_pos) < ARRIVE_DIST:
+        nav_state["frontier_pos"] = None
+
+    # Pick a new frontier when needed
+    if nav_state.get("frontier_pos") is None or not nav_state.get("waypoints"):
+        new_f = explore_map.best_frontier(robot_pos)
+        if new_f is not None:
+            nav_state["frontier_pos"] = new_f.tolist()
+            nav_state["waypoints"]    = _replan(env, robot_pos, new_f)
+        else:
+            # All frontiers exhausted: rotate to fill value map
+            frame, _ = env.step(ACTION_LEFT)
+            nav_state["last_frame"]   = frame
+            nav_state["step_count"]  += 1
+            return nav_state
+
+    # Follow waypoints toward the frontier (same steering logic as follow_path)
+    waypoints = nav_state.get("waypoints", [])
+    if not waypoints:
+        action = ACTION_LEFT
+    else:
+        # Pop waypoints that are already within reach
+        while waypoints and _euclidean(robot_pos, waypoints[0]) < WP_REACH:
+            waypoints.pop(0)
+
+        if not waypoints:
+            action = ACTION_LEFT
+        else:
+            next_wp         = np.array(waypoints[0])
+            to_wp           = next_wp - robot_pos
+            forward         = _get_forward(env)
+            angle, action   = _turn_to(forward, to_wp)
+            if angle < ALIGN_THRESH:
+                action = ACTION_FORWARD
+
+    frame, _ = env.step(action)
+
+    # Pop waypoints now that we've moved
+    new_pos, _ = env.get_robot_pose()
+    while waypoints and _euclidean(new_pos, waypoints[0]) < WP_REACH:
+        waypoints.pop(0)
+
+    nav_state["waypoints"]   = waypoints
+    nav_state["last_frame"]  = frame
+    nav_state["step_count"] += 1
+    return nav_state
+
+
+# ── main task loop ──────────────────────────────────────────────────────────
 
 def run_task(
     env,
     task: str,
     scene_dir: str = SCENE_DIR,
-    on_frame: Optional[Callable[[np.ndarray, dict], None]] = None,
+    on_frame: Optional[Callable] = None,
     llm_perceive=None,
 ) -> dict:
-    """Execute a single navigation task, blocking until done or timed out.
-
-    env          – a HabitatEnv instance that has already been reset
-    task         – Chinese goal keyword, e.g. "沙发"
-    scene_dir    – path to the HM3D scene directory
-    on_frame     – optional callback(frame, nav_state) called after each step
-                   (used for WebSocket streaming)
-    llm_perceive – optional function(frame, goal) → {target_visible, distance}
-                   that augments rule-based navigation with vision perception
-
-    Returns the final nav_state dict (check nav_state["done"]).
     """
-    from agent.skills import follow_path, search_room, verify_arrival
+    Exploration-based navigation.  No pre-computed semantic labels used.
 
-    frame     = env.get_frame()
-    nav_state = _init_nav_state(env, task, scene_dir)
-    nav_state["last_frame"] = frame
+    env          – HabitatEnv (already reset to the target scene)
+    task         – Chinese goal keyword, e.g. "沙发"
+    on_frame     – optional callback(frame, nav_state) for WebSocket streaming
+    llm_perceive – optional function(frame, goal) → percept dict
+                   {"target_visible", "direction", "distance", "confidence"}
+    """
+    from agent.skills import follow_path, verify_arrival
+
+    explore_map = ExploreMap()
+
+    nav_state: dict = {
+        "goal":          task,
+        "target_pos":    None,        # set when VLM localises the object
+        "step_count":    0,
+        "current_skill": "explore_frontier",
+        "done":          False,
+        "last_frame":    env.get_frame(),
+        "last_percept":  {"target_visible": False, "confidence": 0.0},
+        "waypoints":     [],
+        "explore_map":   explore_map,
+        "frontier_pos":  None,
+        "vlm_step":      -VLM_CALL_INTERVAL,  # trigger VLM immediately
+    }
 
     if on_frame:
-        on_frame(frame, nav_state)
+        on_frame(nav_state["last_frame"], nav_state)
 
     skill_map = {
         "follow_path":    follow_path,
-        "search_room":    search_room,
         "verify_arrival": verify_arrival,
     }
 
     while not nav_state["done"] and nav_state["step_count"] < MAX_STEPS:
-        # PERCEIVE: optional LLM vision pass
-        if llm_perceive is not None:
+        step = nav_state["step_count"]
+
+        # ── robot state ────────────────────────────────────────────────
+        robot_pos, _ = env.get_robot_pose()
+        R             = env.get_rotation_matrix()
+
+        # ── VLM perception (throttled) ─────────────────────────────────
+        if (
+            llm_perceive is not None
+            and (step - nav_state["vlm_step"]) >= VLM_CALL_INTERVAL
+        ):
             try:
-                percept = llm_perceive(nav_state["last_frame"], task)
+                percept               = llm_perceive(nav_state["last_frame"], task)
                 nav_state["last_percept"] = percept
-                if percept.get("target_visible") and nav_state["current_skill"] == "search_room":
-                    nav_state["current_skill"] = "follow_path"
+                nav_state["vlm_step"]     = step
+
+                confidence = float(percept.get("confidence", 0.0))
+
+                if percept.get("target_visible") and confidence >= VLM_CONF_THRESHOLD:
+                    # Localise target in 3-D using depth + direction hint
+                    depth     = env.get_depth()
+                    direction = percept.get("direction", "center")
+                    tgt       = _estimate_target_pos(depth, direction, robot_pos, R)
+                    if tgt is not None:
+                        nav_state["target_pos"]     = tgt.tolist()
+                        nav_state["current_skill"]  = "follow_path"
+                        nav_state["waypoints"]       = []
             except Exception:
                 pass
 
-        current = nav_state.get("current_skill", "follow_path")
+        # ── update value map ───────────────────────────────────────────
+        vlm_score = float(nav_state["last_percept"].get("confidence", 0.0))
+        explore_map.update(robot_pos, R, vlm_score)
+
+        # ── execute skill ──────────────────────────────────────────────
+        current = nav_state.get("current_skill", "explore_frontier")
+
         if current == "done":
             nav_state["done"] = True
             break
+        elif current in skill_map:
+            nav_state = skill_map[current](env, nav_state)
+        else:
+            nav_state = _explore_frontier(env, nav_state, explore_map)
 
-        skill_fn  = skill_map.get(current, follow_path)
-        nav_state = skill_fn(env, nav_state)
-
+        # ── stream frame ───────────────────────────────────────────────
         if on_frame and nav_state.get("last_frame") is not None:
             on_frame(nav_state["last_frame"], nav_state)
 
@@ -127,41 +238,44 @@ def run_task(
     return nav_state
 
 
+# ── smoke test ──────────────────────────────────────────────────────────────
+
 def demo(scene_dir: str = SCENE_DIR, target: str = "沙发"):
-    """Smoke-test the control loop: save one PNG per step to /tmp/loop_frames/."""
+    """Run the exploration loop, saving frames to /tmp/loop_frames/."""
     import imageio
     from pathlib import Path
     from agent.habitat_env import HabitatEnv
+    from agent.llm_agent import perceive
 
     out_dir = Path("/tmp/loop_frames")
     out_dir.mkdir(exist_ok=True)
 
     env       = HabitatEnv(gpu_id=0)
-    frame_idx = [0]
+    idx       = [0]
 
     env.reset(scene_dir)
 
-    def save_frame(frame: np.ndarray, state: dict):
-        path = out_dir / f"frame_{frame_idx[0]:04d}.png"
-        imageio.imwrite(str(path), frame)
-        step  = state.get("step_count", 0)
-        skill = state.get("current_skill", "?")
-        dist_str = ""
-        if state.get("target_pos"):
-            pos, _ = env.get_robot_pose()
-            from agent.skills import _euclidean
-            dist_str = f", dist={_euclidean(pos, state['target_pos']):.2f}m"
-        if step % 20 == 0 or step < 5:
-            print(f"  step={step:03d} skill={skill}{dist_str}")
-        frame_idx[0] += 1
+    def save_frame(frame, state):
+        imageio.imwrite(str(out_dir / f"frame_{idx[0]:04d}.png"), frame)
+        s = state.get("step_count", 0)
+        if s % 10 == 0:
+            skill = state.get("current_skill", "?")
+            conf  = state.get("last_percept", {}).get("confidence", 0.0)
+            expl  = state["explore_map"].explored_fraction() * 100
+            print(f"  step={s:03d} skill={skill} conf={conf:.2f} explored={expl:.1f}%")
+        idx[0] += 1
 
-    print(f"Task: navigate to '{target}'")
-    result = run_task(env, target, scene_dir=scene_dir, on_frame=save_frame)
-
+    print(f"Task: '{target}' (exploration mode, VLM enabled)")
+    result = run_task(
+        env, target, scene_dir=scene_dir,
+        on_frame=save_frame,
+        llm_perceive=lambda f, g: perceive(f, g),
+    )
     env.close()
-    status = "arrived" if result["done"] else ("timeout" if result.get("timeout") else "incomplete")
-    print(f"\n{status}: steps={result['step_count']}, target={result.get('target_pos')}")
-    print(f"Frames saved to {out_dir}/ ({frame_idx[0]} total)")
+
+    status = "arrived" if result["done"] else ("timeout" if result.get("timeout") else "?")
+    expl   = result["explore_map"].explored_fraction() * 100
+    print(f"\n{status}: steps={result['step_count']}, explored={expl:.1f}%")
     return result
 
 

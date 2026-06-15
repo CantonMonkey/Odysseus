@@ -48,7 +48,7 @@ def _habitat_worker():
     """Own the EGL context; process navigation commands; push frames to _frame_q."""
     from agent.habitat_env import HabitatEnv
     from agent.loop import run_task, SCENE_DIR
-    from agent.llm_agent import DialogueAgent
+    from agent.llm_agent import DialogueAgent, perceive as llm_perceive
 
     env      = HabitatEnv(gpu_id=0)
     dialogue = DialogueAgent()
@@ -76,7 +76,7 @@ def _habitat_worker():
                 }
                 _frame_q.put(("frame", frame, state))
 
-            result = run_task(env, goal, scene_dir=SCENE_DIR, on_frame=on_frame)
+            result = run_task(env, goal, scene_dir=SCENE_DIR, on_frame=on_frame, llm_perceive=llm_perceive)
 
             if result.get("done"):
                 msg   = dialogue.arrival_message()
