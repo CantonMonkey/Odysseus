@@ -96,8 +96,10 @@ def follow_path(env, nav_state: dict) -> dict:
 
     robot_pos, _ = env.get_robot_pose()
     dist = _euclidean(robot_pos, target_pos)
+    step = nav_state.get("step_count", 0)
 
     if dist <= ARRIVE_DIST:
+        print(f"  [FOLLOW step={step}] dist={dist:.3f}m ≤ {ARRIVE_DIST}m → verify_arrival", flush=True)
         nav_state["current_skill"] = "verify_arrival"
         return nav_state
 
@@ -112,7 +114,7 @@ def follow_path(env, nav_state: dict) -> dict:
             nav_state["waypoints"] = waypoints
 
     if not waypoints:
-        # Pathfinder found no route; spin in place until LLM can guide
+        print(f"  [FOLLOW step={step}] no path to target → search_room", flush=True)
         nav_state["current_skill"] = "search_room"
         return nav_state
 
@@ -187,50 +189,50 @@ def verify_arrival(env, nav_state: dict) -> dict:
     robot_pos, _ = env.get_robot_pose()
     target_pos   = nav_state.get("target_pos")
     dist = _euclidean(robot_pos, target_pos) if target_pos else float("inf")
+    step = nav_state["step_count"]
 
     percept        = nav_state.get("last_percept", {})
     target_visible = percept.get("target_visible", False)
     confidence     = float(percept.get("confidence", 0.0))
 
-    # Success: within 0.8m of estimate AND VLM confirms target visible
-    # Tight threshold: estimate can be 0.5-1m off from actual object
     vlm_confirmed = target_visible and confidence >= 0.25 and dist <= 0.8
 
     if vlm_confirmed:
-        # Success confirmed: declare done (robot is within 0.8m of instance)
+        print(f"  [VERIFY step={step}] SUCCESS dist_to_tgt={dist:.3f}m vis={target_visible} conf={confidence:.2f} → DONE", flush=True)
         nav_state["done"]          = True
         nav_state["current_skill"] = "done"
     elif dist <= ARRIVE_DIST and target_visible and confidence >= 0.25:
-        # Visible but not close enough yet (0.8m < dist <= 2.0m): step toward target
-        # Cannot delegate to follow_path (it would immediately bounce back here)
         from agent.habitat_env import ACTION_FORWARD, ACTION_LEFT
         to_target = np.array(target_pos) - robot_pos
         forward = _get_forward(env)
         angle, turn_action = _turn_to(forward, to_target)
         step_action = ACTION_FORWARD if angle < ALIGN_THRESH else turn_action
+        action_name = "FORWARD" if step_action == ACTION_FORWARD else "TURN"
+        print(f"  [VERIFY step={step}] stepping {action_name} toward target dist={dist:.3f}m (need ≤0.8m) vis=True conf={confidence:.2f}", flush=True)
         frame, _ = env.step(step_action)
         nav_state["last_frame"]  = frame
         nav_state["step_count"] += 1
         nav_state["verify_scanned"] = 0
     elif dist <= ARRIVE_DIST and not target_visible:
-        # Scan: rotate to try to re-acquire the target before giving up
         scanned = nav_state.get("verify_scanned", 0)
-        if scanned < 24:  # full 360° scan (24 × 15° rotations)
+        if scanned < 24:
             from agent.habitat_env import ACTION_LEFT
             frame, _ = env.step(ACTION_LEFT)
             nav_state["last_frame"]     = frame
             nav_state["step_count"]    += 1
             nav_state["verify_scanned"] = scanned + 1
-            # Trigger VLM every 3rd rotation (every 45°) to balance speed vs coverage
+            if scanned % 6 == 0:
+                print(f"  [VERIFY step={step}] scanning ({scanned+1}/24) dist={dist:.3f}m vis=False → rotating", flush=True)
             if scanned % 3 == 0:
                 nav_state["vlm_step"] = nav_state["step_count"] - 8
         else:
-            # Full 360° scan done, target not found — depth estimate was wrong
+            print(f"  [VERIFY step={step}] 360° scan complete, target NOT found → revert to explore (depth estimate wrong)", flush=True)
             nav_state["target_pos"]     = None
             nav_state["current_skill"]  = "explore_frontier"
             nav_state["waypoints"]      = []
             nav_state["verify_scanned"] = 0
     else:
+        print(f"  [VERIFY step={step}] dist={dist:.3f}m > ARRIVE_DIST={ARRIVE_DIST}m → back to follow_path", flush=True)
         nav_state["current_skill"] = "follow_path"
         nav_state["verify_scanned"] = 0
 

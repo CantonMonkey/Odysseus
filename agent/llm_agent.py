@@ -27,7 +27,7 @@ _local_model     = None
 _local_tokenizer = None
 
 def _get_local_model():
-    """Lazy-load InternVL3 in bfloat16 onto CUDA (singleton)."""
+    """Lazy-load InternVL3 in float16 onto CUDA (singleton)."""
     global _local_model, _local_tokenizer
     if _local_model is not None:
         return _local_model, _local_tokenizer
@@ -115,7 +115,7 @@ def _perceive_local(frame: np.ndarray, goal: str) -> dict:
         return _perceive_rule(frame, goal)
 
     pil = Image.fromarray(frame.astype(np.uint8))
-    pixel_values = _internvl_pixel_values(pil, max_num=6)
+    pixel_values = _internvl_pixel_values(pil, max_num=4)
 
     prompt = (
         "<image>\n"
@@ -134,8 +134,10 @@ def _perceive_local(frame: np.ndarray, goal: str) -> dict:
     )
 
     try:
+        import torch
         gen_cfg = dict(max_new_tokens=128, do_sample=False)
         text = model.chat(tokenizer, pixel_values, prompt, gen_cfg)
+        torch.cuda.empty_cache()
         text = (text or "").strip()
         if not text or "{" not in text:
             return _perceive_rule(frame, goal)
@@ -145,6 +147,8 @@ def _perceive_local(frame: np.ndarray, goal: str) -> dict:
             result["direction"]  = "not_visible"
         return result
     except Exception as e:
+        import torch
+        torch.cuda.empty_cache()
         print(f"[InternVL3] perceive error: {e}", flush=True)
         return _perceive_rule(frame, goal)
 
