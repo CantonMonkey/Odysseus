@@ -103,6 +103,65 @@ def perceive(frame: np.ndarray, goal: str) -> dict:
         return _perceive_rule(frame, goal)
 
 
+
+def classify_scene(frame, goal: str) -> dict:
+    """
+    Identify current room type and visible objects (fires every ~20 steps).
+
+    Returns:
+        {"room": str, "objects": [str], "floor_hint": str, "suggest": str}
+        suggest: "go_upstairs" | "search_room" | "keep_exploring" | "none"
+
+    Used to annotate topo_map nodes and bias frontier selection.
+    Does NOT return target_visible — that is perceive()'s job.
+    """
+    client = _get_client()
+    if client is None:
+        return {"room": "其他", "objects": [], "floor_hint": "unknown", "suggest": "none"}
+
+    import json, time
+    img_b64 = _frame_to_b64(frame)
+    prompt = (
+        f"你是家居导航机器人。导航目标：{goal}\n"
+        "观察当前第一视角图像，只返回一行JSON，禁止其他文字:\n"
+        '{"room":"客厅|卧室|走廊|厨房|楼梯间|浴室|其他",'
+        '"objects":["列出画面中可见的家具/物品，最多5个"],'
+        '"floor_hint":"ground|upper|unknown",'
+        '"suggest":"go_upstairs|search_room|keep_exploring|none"}\n'
+        "suggest规则:\n"
+        f"- 若{goal}通常在其他楼层（如床在二楼卧室）且画面中有楼梯 → go_upstairs\n"
+        f"- 若当前房间可能有{goal}但未完全扫描 → search_room\n"
+        "- 其他情况 → keep_exploring"
+    )
+
+    text = ""
+    for attempt in range(2):
+        try:
+            resp = client.messages.create(
+                model=_MODEL_PERCEIVE,
+                max_tokens=128,
+                messages=[{"role": "user", "content": [
+                    {"type": "image", "source": {
+                        "type": "base64", "media_type": "image/jpeg", "data": img_b64}},
+                    {"type": "text", "text": prompt},
+                ]}],
+            )
+            text = _extract_text(resp.content).strip()
+            if text and "{" in text:
+                break
+        except Exception:
+            pass
+        if attempt < 1:
+            time.sleep(0.3)
+
+    if not text or "{" not in text:
+        return {"room": "其他", "objects": [], "floor_hint": "unknown", "suggest": "none"}
+    try:
+        return json.loads(text[text.find("{"):text.rfind("}")+1])
+    except Exception:
+        return {"room": "其他", "objects": [], "floor_hint": "unknown", "suggest": "none"}
+
+
 def _perceive_rule(frame: np.ndarray, goal: str) -> dict:
     """Rule-based fallback: report target not visible, trust semantic-map nav."""
     return {"target_visible": False, "direction": "not_visible", "distance": 99.0, "confidence": 0.0}
