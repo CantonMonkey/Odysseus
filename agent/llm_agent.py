@@ -57,24 +57,25 @@ def perceive(frame: np.ndarray, goal: str) -> dict:
     import json, time
     img_b64 = _frame_to_b64(frame)
     prompt = (
-        "你是家居导航机器人的视觉感知模块。\n"
-        f"导航目标：{goal}\n"
-        "观察第一视角图像，只返回一行JSON，禁止其他文字:\n"
+        f"You are a home navigation robot. Navigation goal: {goal}\n"
+        "Observe the entire image carefully (foreground/background/doorways/distance). Return ONE JSON line, no other text:\n"
         '{"target_visible":bool,"direction":"left|center|right|not_visible",'
-        '"distance":float,"confidence":float}\n'
-        "规则:\n"
-        "- target_visible=true: 目标在画面中可见\n"
-        "- confidence: 仅target_visible=true时填识别把握(0.0-1.0)，否则必须填0.0\n"
-        "- distance: 目标估计距离(米)，不可见填99\n"
-        "- direction: 不可见填not_visible"
+        '"confidence":float,"room":"living_room|bedroom|hallway|kitchen|staircase|bathroom|other",'
+        '"relevance":float}\n'
+        "Rules:\n"
+        f"- target_visible=true: goal object {goal} is visible ANYWHERE (background/doorway/corner counts)\n"
+        "- confidence: if visible 0.1-1.0 (partial/far=0.3-0.6, clear=0.8+), else 0.0\n"
+        "- room: room type you are currently in\n"
+        f"- relevance: 0.0-1.0, how likely navigating this direction leads to {goal}\n"
+        "  (living_room for sofa/chair→0.9, hallway→0.4, bedroom for sofa→0.1, kitchen for sofa→0.05)\n"
+        "- direction: where the target is in the image, not_visible if unseen"
     )
-
     text = ""
     for attempt in range(3):
         try:
             response = client.messages.create(
                 model=_MODEL_PERCEIVE,
-                max_tokens=128,
+                max_tokens=1024,
                 messages=[{"role": "user", "content": [
                     {"type": "image", "source": {
                         "type": "base64", "media_type": "image/jpeg", "data": img_b64}},
@@ -139,7 +140,7 @@ def classify_scene(frame, goal: str) -> dict:
         try:
             resp = client.messages.create(
                 model=_MODEL_PERCEIVE,
-                max_tokens=128,
+                max_tokens=1024,
                 messages=[{"role": "user", "content": [
                     {"type": "image", "source": {
                         "type": "base64", "media_type": "image/jpeg", "data": img_b64}},
@@ -164,7 +165,7 @@ def classify_scene(frame, goal: str) -> dict:
 
 def _perceive_rule(frame: np.ndarray, goal: str) -> dict:
     """Rule-based fallback: report target not visible, trust semantic-map nav."""
-    return {"target_visible": False, "direction": "not_visible", "distance": 99.0, "confidence": 0.0}
+    return {"target_visible": False, "direction": "not_visible", "distance": 99.0, "confidence": 0.0, "room": "other", "relevance": 0.2}
 
 
 def _frame_to_b64(frame: np.ndarray) -> str:
@@ -213,7 +214,7 @@ class DialogueAgent:
             try:
                 resp = client.messages.create(
                     model=_MODEL_DIALOGUE,
-                    max_tokens=128,
+                    max_tokens=1024,
                     messages=[{
                         "role": "user",
                         "content": (
@@ -243,7 +244,7 @@ class DialogueAgent:
             try:
                 resp = client.messages.create(
                     model=_MODEL_DIALOGUE,
-                    max_tokens=128,
+                    max_tokens=1024,
                     messages=[{
                         "role": "user",
                         "content": "你是家居机器人，刚刚完成导航到达目标位置，用一句简短的中文询问用户还需要什么帮助。",

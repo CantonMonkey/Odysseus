@@ -323,7 +323,7 @@ def run_task(
 
         # ── Stagnation detection: escape if exploration stuck ──────────
         if current_skill_pre := nav_state.get("current_skill", "explore_frontier"):
-            if current_skill_pre == "explore_frontier" and not nav_state.get("escape_in_progress", False):
+            if current_skill_pre == "explore_frontier":
                 cur_expl = explore_map.explored_fraction()
                 if abs(cur_expl - nav_state.get("last_expl", 0.0)) < 0.001:
                     nav_state["stagnant_steps"] = nav_state.get("stagnant_steps", 0) + 1
@@ -381,8 +381,6 @@ def run_task(
                         nav_state["last_expl"] = explore_map.explored_fraction()
                         nav_state["explore_anchor"] = rp_list
                         nav_state["anchor_steps_left"] = 80
-                        nav_state["escape_in_progress"] = True
-                        nav_state["escape_target"] = rp_list
                         print(f"  [ESCAPE step={step}] {_tag} dist={best_dist:.1f}m robot=({robot_pos[0]:.1f},{robot_pos[2]:.1f}) tgt=({rp_list[0]:.1f},{rp_list[2]:.1f})", flush=True)
                     else:
                         # Truly stuck in isolated navmesh island — just rotate
@@ -390,14 +388,6 @@ def run_task(
                         print(f"  [STUCK step={step}] isolated navmesh island, rotating", flush=True)
 
         # ── Execute skill ──────────────────────────────────────────────
-        # Clear escape_in_progress once robot is within 3m of the escape target
-        if nav_state.get("escape_in_progress") and nav_state.get("escape_target"):
-            from agent.skills import _euclidean as _eu
-            _et = np.array(nav_state["escape_target"])
-            if _eu(robot_pos, _et) < 3.0:
-                nav_state["escape_in_progress"] = False
-                nav_state["escape_target"] = None
-
         current = nav_state.get("current_skill", "explore_frontier")
         if step % 30 == 0:
             expl = explore_map.explored_fraction()
