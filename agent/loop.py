@@ -20,10 +20,9 @@ from typing import Callable, Optional
 from agent.explore_map import ExploreMap, VLM_CALL_INTERVAL
 from agent.topo_map   import TopoMap
 
-MAX_STEPS          = 300
+MAX_STEPS          = 500
 ARRIVE_DIST        = 1.2
-VLM_CONF_THRESHOLD = 0.55
-CLASSIFY_INTERVAL  = 20   # room classification + topo node every N steps
+VLM_CONF_THRESHOLD = 0.25
 
 from pathlib import Path
 _DATA     = Path("/data3/liangjy/vln/data/hm3d")
@@ -32,20 +31,42 @@ SCENE_DIR = str(_DATA / "00800-TEEsavR23oF")
 
 # ── 3-D target localisation ─────────────────────────────────────────────────
 
-def _estimate_target_pos(depth_frame, direction, agent_pos, R, hfov=90.0):
+def _estimate_target_pos(depth_frame, direction, agent_pos, R, hfov=90.0,
+                          vlm_dist: float = 99.0):
+    """Back-project target direction to a world 3-D waypoint.
+
+    VLM gives reliable direction (left/center/right) but poor distance.
+    Depth sensor gives precise measurements but may have foreground clutter.
+
+    Strategy: in the direction column, prefer the BACKGROUND depth cluster
+    (85th percentile) so we navigate toward the target rather than the wall
+    in front of it.  Fall back to a fixed-distance directional waypoint when
+    depth has no valid far readings.
+    """
     H, W   = depth_frame.shape
     fx     = W / (2.0 * np.tan(np.radians(hfov / 2.0)))
     cx, cy = W / 2.0, H / 2.0
-    col    = {"left": W // 4, "center": W // 2, "right": 3 * W // 4}.get(direction, W // 2)
-    u, v   = col, int(cy)
-    patch  = depth_frame[max(0,v-40):min(H,v+40), max(0,u-30):min(W,u+30)]
-    valid  = patch[(patch > 0.3) & (patch < 7.0)]
-    if len(valid) == 0:
-        return None
-    d     = float(np.median(valid))
-    x_c   = (u - cx) * d / fx
-    z_c   = -d
-    p     = R @ np.array([x_c, 0.0, z_c]) + agent_pos + np.array([0, 1.0, 0])
+
+    # Sample a vertical strip in the target direction
+    col_center = {"left": W // 4, "center": W // 2, "right": 3 * W // 4}.get(direction, W // 2)
+    col_lo = max(0, col_center - 40)
+    col_hi = min(W, col_center + 40)
+    strip  = depth_frame[H//4 : 3*H//4, col_lo:col_hi]   # middle 50% vertically
+
+    valid = strip[(strip > 0.5) & (strip < 8.0)].flatten()
+
+    if len(valid) < 10:
+        # No usable depth — use fixed 3m directional waypoint
+        d = 3.0
+    else:
+        # Use 85th-percentile depth to prefer background over foreground clutter
+        d = float(np.percentile(valid, 85))
+        # Cap navigation waypoint: don't try to go more than 5m in one shot
+        d = min(d, 5.0)
+
+    x_c = (col_center - cx) * d / fx
+    z_c = -d
+    p   = R @ np.array([x_c, 0.0, z_c]) + agent_pos
     return p.astype(np.float32)
 
 
@@ -60,15 +81,22 @@ def _explore_frontier(env, nav_state: dict, explore_map: ExploreMap,
     robot_pos, _ = env.get_robot_pose()
     task          = nav_state.get("goal", "")
 
-    # Arrive at current frontier → clear it
+    # Arrive at current frontier → clear and blacklist (don't revisit)
     f_pos = nav_state.get("frontier_pos")
     if f_pos is not None and _euclidean(robot_pos, np.array(f_pos)) < ARRIVE_DIST:
+        # Blacklist the frontier we just visited so we don't return to it
+        f_arr = np.array(f_pos)
+        fi, fj = explore_map._w2g(float(f_arr[0]), float(f_arr[2]))
+        failed = nav_state.get("failed_frontiers", set())
+        failed.add((fi, fj))
+        nav_state["failed_frontiers"] = failed
         nav_state["frontier_pos"] = None
         nav_state["waypoints"]    = []
 
     # Need a new frontier target
     if not nav_state.get("frontier_pos") or not nav_state.get("waypoints"):
         target = None
+        failed = nav_state.get("failed_frontiers", set())
 
         # 1. Ask topo_map for commonsense direction
         hint = topo_map.suggest_goal_direction(task, robot_pos)
@@ -82,18 +110,58 @@ def _explore_frontier(env, nav_state: dict, explore_map: ExploreMap,
             if stair is not None:
                 target = stair
 
-        # 2. Fallback: best VLM-scored frontier
+        # 2. Fallback: best VLM-scored frontier (skip recently-failed ones)
         if target is None:
-            target = explore_map.best_frontier(robot_pos)
+            cells = explore_map.frontiers()
+            ri, rj = explore_map._w2g(robot_pos[0], robot_pos[2])
+            pf_nav = env._sim.pathfinder
+            best_score, best_ij = -1.0, None
+            for i, j in cells:
+                if (i, j) in failed:
+                    continue
+                wx, wz = explore_map._g2w(i, j)
+                # Skip wall-boundary frontiers: if navmesh snap moves > 1.5m, it's in a wall
+                cell_world = np.array([wx, robot_pos[1], wz], dtype=np.float32)
+                snapped = pf_nav.snap_point(cell_world)
+                if not np.any(np.isnan(snapped)):
+                    snap_dist = float(np.linalg.norm(snapped[[0,2]] - cell_world[[0,2]]))
+                    if snap_dist > 1.5:
+                        failed.add((i, j))
+                        continue
+                v    = float(explore_map.value[i, j])
+                dist = np.sqrt((i - ri)**2 + (j - rj)**2) * explore_map.res
+                prox = max(0.0, (6.0 - dist) / 6.0) * 0.05
+                s    = v + prox
+                if s > best_score:
+                    best_score, best_ij = s, (i, j)
+            if best_ij is not None:
+                wx, wz = explore_map._g2w(*best_ij)
+                target = np.array([wx, robot_pos[1], wz], dtype=np.float32)
             if target is None:
-                # All frontiers exhausted: rotate in place
+                # All frontiers exhausted or all failed: reset failed set and rotate
+                nav_state["failed_frontiers"] = set()
                 frame, _ = env.step(ACTION_LEFT)
                 nav_state["last_frame"]  = frame
                 nav_state["step_count"] += 1
                 return nav_state
 
-        nav_state["frontier_pos"] = target.tolist() if hasattr(target, 'tolist') else list(target)
-        nav_state["waypoints"]    = _replan(env, robot_pos, target)
+        wps = _replan(env, robot_pos, target)
+        if not wps:
+            # Frontier unreachable — blacklist it and skip
+            t_arr = np.array(target)
+            fi, fj = explore_map._w2g(float(t_arr[0]), float(t_arr[2]))
+            failed.add((fi, fj))
+            nav_state["failed_frontiers"] = failed
+            nav_state["frontier_pos"] = None
+            nav_state["waypoints"]    = []
+            frame, _ = env.step(ACTION_LEFT)
+            nav_state["last_frame"]  = frame
+            nav_state["step_count"] += 1
+            return nav_state
+
+        nav_state["frontier_pos"]      = target.tolist() if hasattr(target, 'tolist') else list(target)
+        nav_state["waypoints"]         = wps
+        nav_state["failed_frontiers"]  = failed
 
     # Follow waypoints
     waypoints = nav_state.get("waypoints", [])
@@ -138,7 +206,6 @@ def run_task(
                   Used for both target detection and scene classification.
     """
     from agent.skills    import follow_path, verify_arrival
-    from agent.llm_agent import classify_scene
 
     explore_map = ExploreMap()
     topo_map    = TopoMap()
@@ -155,8 +222,9 @@ def run_task(
         "explore_map":    explore_map,
         "topo_map":       topo_map,
         "frontier_pos":   None,
+        "last_expl":      0.0,
+        "stagnant_steps": 0,
         "vlm_step":       -VLM_CALL_INTERVAL,
-        "classify_step":  -CLASSIFY_INTERVAL,
         "last_scene":     {},
     }
 
@@ -173,14 +241,26 @@ def run_task(
         robot_pos, _ = env.get_robot_pose()
         R            = env.get_rotation_matrix()
 
-        # ── VLM target detection (every VLM_CALL_INTERVAL steps) ──────
+        # ── VLFM-style VLM call (every VLM_CALL_INTERVAL steps) ────────
+        # Returns: target_visible, direction, confidence, room, relevance
+        # relevance = scene-level expectation of finding goal here (0-1)
+        # This updates the value map every call, not just when target is visible
         if llm_perceive is not None and (step - nav_state["vlm_step"]) >= VLM_CALL_INTERVAL:
             try:
                 percept = llm_perceive(nav_state["last_frame"], task)
                 nav_state["last_percept"] = percept
                 nav_state["vlm_step"]     = step
                 confidence = float(percept.get("confidence", 0.0))
-                if percept.get("target_visible") and confidence >= VLM_CONF_THRESHOLD:
+                vis        = percept.get("target_visible", False)
+                room       = percept.get("room", "其他")
+                print(f"  [VLM step={step}] vis={vis} conf={confidence:.2f} room={room} rel={percept.get('relevance',0):.2f}", flush=True)
+
+                # Build topo map from every VLM call (room info now in percept)
+                if nav_state.get("target_pos") is None:
+                    topo_map.add_node(robot_pos, room, [], step)
+
+                # Direct navigation when target confidently spotted
+                if vis and confidence >= VLM_CONF_THRESHOLD:
                     depth = env.get_depth()
                     tgt   = _estimate_target_pos(
                         depth, percept.get("direction", "center"), robot_pos, R)
@@ -191,28 +271,84 @@ def run_task(
             except Exception:
                 pass
 
-        # ── Scene classification → topo_map node (every CLASSIFY_INTERVAL) ──
-        if (
-            llm_perceive is not None
-            and nav_state.get("target_pos") is None
-            and (step - nav_state["classify_step"]) >= CLASSIFY_INTERVAL
-        ):
-            try:
-                scene = classify_scene(nav_state["last_frame"], task)
-                nav_state["last_scene"]      = scene
-                nav_state["classify_step"]   = step
-                room     = scene.get("room", "其他")
-                objects  = scene.get("objects", [])
-                topo_map.add_node(robot_pos, room, objects, step)
-            except Exception:
-                pass
-
-        # ── Update value map ───────────────────────────────────────────
-        vlm_score = float(nav_state["last_percept"].get("confidence", 0.0))
+        # ── Update value map (VLFM-style: use relevance, not confidence) ──
+        # relevance is non-zero even when target not visible → map has gradient
+        vlm_score = float(nav_state["last_percept"].get("relevance", 0.2))
         explore_map.update(robot_pos, R, vlm_score)
+
+        # ── Stagnation detection: escape if exploration stuck ──────────
+        if current_skill_pre := nav_state.get("current_skill", "explore_frontier"):
+            if current_skill_pre == "explore_frontier":
+                cur_expl = explore_map.explored_fraction()
+                if abs(cur_expl - nav_state.get("last_expl", 0.0)) < 0.001:
+                    nav_state["stagnant_steps"] = nav_state.get("stagnant_steps", 0) + 1
+                else:
+                    nav_state["stagnant_steps"] = 0
+                    nav_state["last_expl"] = cur_expl
+                if nav_state["stagnant_steps"] >= 40:
+                    # Escape: pick FARTHEST reachable navmesh point to break out of stuck area
+                    pf = env._sim.pathfinder
+                    from agent.skills import _replan
+                    escape_candidates = []
+                    for _ in range(50):
+                        rp = pf.get_random_navigable_point()
+                        if not any(np.isnan(rp)) and abs(rp[1] - robot_pos[1]) < 1.0:
+                            dist = float(np.linalg.norm(np.array(rp) - robot_pos))
+                            if dist > 3.0:
+                                wps = _replan(env, robot_pos, rp)
+                                if wps:
+                                    escape_candidates.append((dist, rp.tolist(), wps))
+                    if not escape_candidates:
+                        # Same-floor escape failed — try cross-floor (find stairs/other floor)
+                        for _ in range(50):
+                            rp = pf.get_random_navigable_point()
+                            if not any(np.isnan(rp)):
+                                dist = float(np.linalg.norm(np.array(rp) - robot_pos))
+                                if dist > 3.0:
+                                    wps = _replan(env, robot_pos, rp)
+                                    if wps:
+                                        escape_candidates.append((dist, rp.tolist(), wps))
+                    if not escape_candidates:
+                        # Last resort: any reachable point
+                        for _ in range(20):
+                            rp = pf.get_random_navigable_point()
+                            if not any(np.isnan(rp)):
+                                dist = float(np.linalg.norm(np.array(rp) - robot_pos))
+                                if dist > 0.5:
+                                    wps = _replan(env, robot_pos, rp)
+                                    if wps:
+                                        escape_candidates.append((dist, rp.tolist(), wps))
+                                        break
+                    if escape_candidates:
+                        # Prefer unexplored grid cells; break ties by distance
+                        def _esc_score(c):
+                            gi, gj = explore_map._w2g(c[1][0], c[1][2])
+                            unexp = 1 if (explore_map._valid(gi, gj) and explore_map.grid[gi, gj] == 0) else 0
+                            return unexp * 100.0 + c[0]
+                        escape_candidates.sort(key=lambda x: -_esc_score(x))
+                        best_dist, rp_list, wps = escape_candidates[0]
+                        gi, gj = explore_map._w2g(rp_list[0], rp_list[2])
+                        _tag = "UNEXP" if (explore_map._valid(gi, gj) and explore_map.grid[gi, gj] == 0) else "EXP"
+                        nav_state["frontier_pos"] = rp_list
+                        nav_state["waypoints"] = wps
+                        nav_state["failed_frontiers"] = set()
+                        nav_state["stagnant_steps"] = 0
+                        nav_state["last_expl"] = explore_map.explored_fraction()
+                        print(f"  [ESCAPE step={step}] {_tag} dist={best_dist:.1f}m", flush=True)
+                    else:
+                        # Truly stuck in isolated navmesh island — just rotate
+                        nav_state["stagnant_steps"] = 0
+                        print(f"  [STUCK step={step}] isolated navmesh island, rotating", flush=True)
 
         # ── Execute skill ──────────────────────────────────────────────
         current = nav_state.get("current_skill", "explore_frontier")
+        if step % 30 == 0:
+            expl = explore_map.explored_fraction()
+            dist_to_tgt = None
+            if nav_state.get("target_pos"):
+                tp = np.array(nav_state["target_pos"])
+                dist_to_tgt = float(np.linalg.norm(robot_pos - tp))
+            print(f"  [step={step:03d}] skill={current} expl={expl:.1%} tgt_pos={nav_state.get('target_pos') is not None} dist_to_tgt={dist_to_tgt}", flush=True)
         if current == "done":
             nav_state["done"] = True
             break
