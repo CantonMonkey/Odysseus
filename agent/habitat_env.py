@@ -125,7 +125,13 @@ class HabitatEnv:
             state.position = np.array(start_pos, dtype=np.float32)
             agent.set_state(state)
         else:
-            pos = self._sim.pathfinder.get_random_navigable_point()
+            # Retry until we land on the ground floor (Y < 1.5 m).
+            # Scene 00800 has a second floor at Y≈3.16 m which the navmesh
+            # includes, but all navigable objects are on the ground floor.
+            for _ in range(50):
+                pos = self._sim.pathfinder.get_random_navigable_point()
+                if pos[1] < 1.5:
+                    break
             state = habitat_sim.AgentState()
             state.position = pos
             agent.set_state(state)
