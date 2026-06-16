@@ -98,7 +98,6 @@ def _explore_frontier(env, nav_state: dict, explore_map: ExploreMap,
         nav_state["failed_frontiers"] = failed
         nav_state["frontier_pos"] = None
         nav_state["waypoints"]    = []
-        nav_state["escape_in_progress"] = False  # Reached escape destination
 
     # Need a new frontier target
     if not nav_state.get("frontier_pos") or not nav_state.get("waypoints"):
@@ -249,6 +248,39 @@ def run_task(
         "verify_arrival": verify_arrival,
     }
 
+    # ── Initial 360° scan: rotate in place at spawn to detect nearby targets ──
+    # Helps when L* is small (target right next to spawn but not in initial view)
+    if llm_perceive is not None:
+        from agent.habitat_env import ACTION_LEFT
+        for _init_rot in range(24):  # 24 × 15° = 360°
+            frame, _ = env.step(ACTION_LEFT)
+            nav_state["last_frame"] = frame
+            nav_state["step_count"] += 1
+            if _init_rot % 3 == 2:  # VLM every 3rd rotation = every 45°
+                try:
+                    _robot_pos0, _ = env.get_robot_pose()
+                    _R0 = env.get_rotation_matrix()
+                    percept = llm_perceive(frame, goal)
+                    nav_state["last_percept"] = percept
+                    nav_state["vlm_step"] = nav_state["step_count"]
+                    vis0 = percept.get("target_visible", False)
+                    conf0 = float(percept.get("confidence", 0.0))
+                    room0 = percept.get("room", "other")
+                    explore_map.update(_robot_pos0, _R0, float(percept.get("relevance", 0.2)))
+                    topo_map.add_node(_robot_pos0, room0, [], nav_state["step_count"])
+                    print(f"  [INIT_SCAN rot={_init_rot}] vis={vis0} conf={conf0:.2f} room={room0}", flush=True)
+                    if vis0 and conf0 >= VLM_CONF_THRESHOLD:
+                        depth = env.get_depth()
+                        tgt = _estimate_target_pos(depth, percept.get("direction","center"), _robot_pos0, _R0)
+                        if tgt is not None:
+                            nav_state["target_pos"] = tgt.tolist()
+                            nav_state["current_skill"] = "follow_path"
+                            nav_state["waypoints"] = []
+                            print(f"  [INIT_SCAN] target found at {tgt.tolist()}", flush=True)
+                            break
+                except Exception:
+                    pass
+
     while not nav_state["done"] and nav_state["step_count"] < max_steps:
         step      = nav_state["step_count"]
         robot_pos, _ = env.get_robot_pose()
@@ -351,6 +383,8 @@ def run_task(
                         nav_state["last_expl"] = explore_map.explored_fraction()
                         nav_state["explore_anchor"] = rp_list
                         nav_state["anchor_steps_left"] = 80
+                        nav_state["escape_in_progress"] = True
+                        nav_state["escape_target"] = rp_list
                         print(f"  [ESCAPE step={step}] {_tag} dist={best_dist:.1f}m robot=({robot_pos[0]:.1f},{robot_pos[2]:.1f}) tgt=({rp_list[0]:.1f},{rp_list[2]:.1f})", flush=True)
                     else:
                         # Truly stuck in isolated navmesh island — just rotate
@@ -358,6 +392,14 @@ def run_task(
                         print(f"  [STUCK step={step}] isolated navmesh island, rotating", flush=True)
 
         # ── Execute skill ──────────────────────────────────────────────
+        # Clear escape_in_progress once robot is within 3m of the escape target
+        if nav_state.get("escape_in_progress") and nav_state.get("escape_target"):
+            from agent.skills import _euclidean as _eu
+            _et = np.array(nav_state["escape_target"])
+            if _eu(robot_pos, _et) < 3.0:
+                nav_state["escape_in_progress"] = False
+                nav_state["escape_target"] = None
+
         current = nav_state.get("current_skill", "explore_frontier")
         if step % 30 == 0:
             expl = explore_map.explored_fraction()
