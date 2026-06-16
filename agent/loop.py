@@ -129,6 +129,7 @@ def run_task(
     scene_dir: str = SCENE_DIR,
     on_frame: Optional[Callable] = None,
     llm_perceive=None,
+    max_steps: int = MAX_STEPS,
 ) -> dict:
     """
     Exploration-based ObjectNav.  No pre-computed semantic labels used.
@@ -167,7 +168,7 @@ def run_task(
         "verify_arrival": verify_arrival,
     }
 
-    while not nav_state["done"] and nav_state["step_count"] < MAX_STEPS:
+    while not nav_state["done"] and nav_state["step_count"] < max_steps:
         step      = nav_state["step_count"]
         robot_pos, _ = env.get_robot_pose()
         R            = env.get_rotation_matrix()
@@ -223,7 +224,7 @@ def run_task(
         if on_frame and nav_state.get("last_frame") is not None:
             on_frame(nav_state["last_frame"], nav_state)
 
-    if nav_state["step_count"] >= MAX_STEPS and not nav_state["done"]:
+    if nav_state["step_count"] >= max_steps and not nav_state["done"]:
         nav_state["timeout"] = True
 
     return nav_state

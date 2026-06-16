@@ -159,6 +159,7 @@ def _run_episode(
             scene_dir=scene_dir,
             on_frame=None,
             llm_perceive=llm_perceive,
+            max_steps=max_steps,
         )
     finally:
         env.step = _original_step  # restore
@@ -252,15 +253,19 @@ def run_evaluation(
 
         skipped = 0
         for ep_idx in range(n_episodes_per_goal):
-            ep_result = _run_episode(
-                env=env,
-                scene_dir=scene_dir,
-                goal=goal,
-                instances=instances,
-                max_steps=max_steps,
-                use_vlm=use_vlm,
-                episode_idx=ep_idx,
-            )
+            try:
+                ep_result = _run_episode(
+                    env=env,
+                    scene_dir=scene_dir,
+                    goal=goal,
+                    instances=instances,
+                    max_steps=max_steps,
+                    use_vlm=use_vlm,
+                    episode_idx=ep_idx,
+                )
+            except Exception as _e:
+                print(f"    [error] ep={ep_idx}: {_e}")
+                ep_result = None
             if ep_result is None:
                 skipped += 1
                 continue
