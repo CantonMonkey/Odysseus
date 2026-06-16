@@ -1,15 +1,15 @@
 """
 llm_agent.py
 
-LLM interface layer: Claude Vision perception + Claude dialogue management.
-When ANTHROPIC_API_KEY is not set, both functions fall back to simple rules
-so the rest of the pipeline keeps running without modification.
+LLM interface for visual perception + dialogue management.
 
-Environment variables (follow the mimo pattern in ~/.zshrc):
-  ANTHROPIC_API_KEY      – API key (required for LLM features)
-  ANTHROPIC_BASE_URL     – custom base URL, e.g. https://api.xiaomimimo.com/anthropic
-  VLN_PERCEIVE_MODEL     – model used for visual perception (default: claude-sonnet-4-6)
-  VLN_DIALOGUE_MODEL     – model used for goal parsing / replies (default: claude-haiku-4-5-20251001)
+Two backends (local takes priority):
+  LOCAL (InternVL3-8B, on-device):
+    VLN_LOCAL_MODEL  – path to model weights dir
+  API (Anthropic-compatible):
+    ANTHROPIC_API_KEY, ANTHROPIC_BASE_URL, VLN_PERCEIVE_MODEL, VLN_DIALOGUE_MODEL
+
+Falls back to rule-based defaults if neither is configured.
 """
 
 import os
@@ -17,12 +17,139 @@ import base64
 import numpy as np
 from typing import Optional
 
-# Model names: override via env to route through any Anthropic-compatible provider
-_MODEL_PERCEIVE = os.environ.get("VLN_PERCEIVE_MODEL",  "claude-sonnet-4-6")
-_MODEL_DIALOGUE = os.environ.get("VLN_DIALOGUE_MODEL",  "claude-haiku-4-5-20251001")
+_LOCAL_MODEL_PATH = os.environ.get("VLN_LOCAL_MODEL", "")
+_MODEL_PERCEIVE   = os.environ.get("VLN_PERCEIVE_MODEL",  "claude-sonnet-4-6")
+_MODEL_DIALOGUE   = os.environ.get("VLN_DIALOGUE_MODEL",  "claude-haiku-4-5-20251001")
+
+# ── Local InternVL3 backend ───────────────────────────────────────────────────
+
+_local_model     = None
+_local_tokenizer = None
+
+def _get_local_model():
+    """Lazy-load InternVL3 in bfloat16 onto CUDA (singleton)."""
+    global _local_model, _local_tokenizer
+    if _local_model is not None:
+        return _local_model, _local_tokenizer
+    if not _LOCAL_MODEL_PATH:
+        return None, None
+    try:
+        import torch
+        from transformers import AutoTokenizer, AutoModel
+        print(f"[InternVL3] Loading from {_LOCAL_MODEL_PATH} ...", flush=True)
+        _local_tokenizer = AutoTokenizer.from_pretrained(
+            _LOCAL_MODEL_PATH, trust_remote_code=True, use_fast=False)
+        _local_model = AutoModel.from_pretrained(
+            _LOCAL_MODEL_PATH,
+            torch_dtype=torch.bfloat16,
+            device_map="cuda",
+            trust_remote_code=True,
+        ).eval()
+        print("[InternVL3] Model ready.", flush=True)
+        return _local_model, _local_tokenizer
+    except Exception as e:
+        print(f"[InternVL3] Load failed: {e}", flush=True)
+        return None, None
 
 
-# ── API client (lazy-loaded; missing key does not crash the process) ──────────
+def _internvl_pixel_values(pil_image, max_num=6):
+    """Dynamic tiling pre-processing for InternVL2/3."""
+    import torch
+    import torchvision.transforms as T
+    from torchvision.transforms.functional import InterpolationMode
+
+    IMAGE_SIZE = 448
+    MEAN = (0.485, 0.456, 0.406)
+    STD  = (0.229, 0.224, 0.225)
+
+    transform = T.Compose([
+        T.Lambda(lambda img: img.convert("RGB") if img.mode != "RGB" else img),
+        T.Resize((IMAGE_SIZE, IMAGE_SIZE), interpolation=InterpolationMode.BICUBIC),
+        T.ToTensor(),
+        T.Normalize(mean=MEAN, std=STD),
+    ])
+
+    def _best_ratio(aspect, target_ratios):
+        best, best_diff = (1, 1), float("inf")
+        for r in target_ratios:
+            diff = abs(aspect - r[0] / r[1])
+            if diff < best_diff:
+                best_diff, best = diff, r
+        return best
+
+    w, h = pil_image.size
+    aspect = w / h
+    target_ratios = sorted(
+        {(i, j)
+         for n in range(1, max_num + 1)
+         for i in range(1, n + 1)
+         for j in range(1, n + 1)
+         if 1 <= i * j <= max_num},
+        key=lambda x: x[0] * x[1],
+    )
+    tr = _best_ratio(aspect, target_ratios)
+    tw, th = IMAGE_SIZE * tr[0], IMAGE_SIZE * tr[1]
+    resized = pil_image.resize((tw, th))
+
+    tiles = []
+    cols = tr[0]
+    for idx in range(tr[0] * tr[1]):
+        c = idx % cols
+        r = idx // cols
+        tile = resized.crop((c * IMAGE_SIZE, r * IMAGE_SIZE,
+                              (c + 1) * IMAGE_SIZE, (r + 1) * IMAGE_SIZE))
+        tiles.append(transform(tile))
+    # thumbnail always appended last
+    if len(tiles) != 1:
+        tiles.append(transform(pil_image.resize((IMAGE_SIZE, IMAGE_SIZE))))
+    return torch.stack(tiles).to(torch.bfloat16).cuda()
+
+
+def _perceive_local(frame: np.ndarray, goal: str) -> dict:
+    """InternVL3 local inference for visual perception."""
+    import json
+    from PIL import Image
+
+    model, tokenizer = _get_local_model()
+    if model is None:
+        return _perceive_rule(frame, goal)
+
+    pil = Image.fromarray(frame.astype(np.uint8))
+    pixel_values = _internvl_pixel_values(pil, max_num=6)
+
+    prompt = (
+        "<image>\n"
+        f"You are a home navigation robot. Navigation goal: {goal}\n"
+        "Observe the entire image carefully. Return ONE JSON line, no other text:\n"
+        '{"target_visible":bool,"direction":"left|center|right|not_visible",'
+        '"confidence":float,"room":"living_room|bedroom|hallway|kitchen|staircase|bathroom|other",'
+        '"relevance":float}\n'
+        "Rules:\n"
+        f"- target_visible=true: {goal} is visible ANYWHERE (background/doorway/corner counts)\n"
+        "- confidence: if visible 0.1-1.0 (partial/far=0.3-0.6, clear=0.8+), else 0.0\n"
+        "- room: room type you are currently in\n"
+        f"- relevance: 0.0-1.0, how likely navigating this direction leads to {goal}\n"
+        "  (living_room for sofa/chair=0.9, hallway=0.4, bedroom for sofa=0.1)\n"
+        "- direction: where the target is (left/center/right), not_visible if absent"
+    )
+
+    try:
+        gen_cfg = dict(max_new_tokens=128, do_sample=False)
+        text = model.chat(tokenizer, pixel_values, prompt, gen_cfg)
+        text = (text or "").strip()
+        if not text or "{" not in text:
+            return _perceive_rule(frame, goal)
+        result = json.loads(text[text.find("{"):text.rfind("}")+1])
+        if not result.get("target_visible", False):
+            result["confidence"] = 0.0
+            result["direction"]  = "not_visible"
+        return result
+    except Exception as e:
+        print(f"[InternVL3] perceive error: {e}", flush=True)
+        return _perceive_rule(frame, goal)
+
+
+# ── API (Anthropic-compatible) backend ───────────────────────────────────────
 
 def _get_client():
     key = os.environ.get("ANTHROPIC_API_KEY", "")
@@ -30,26 +157,39 @@ def _get_client():
         return None
     try:
         import anthropic
-        # ANTHROPIC_BASE_URL is read automatically by the SDK if set in the environment
         return anthropic.Anthropic(api_key=key)
     except Exception:
         return None
 
 
 def _extract_text(content_blocks) -> str:
-    """Return the first text from a list of content blocks, skipping ThinkingBlocks."""
+    """Return the first text block, skipping ThinkingBlocks."""
     return next((b.text for b in content_blocks if hasattr(b, "text")), "")
 
 
-# ── PERCEIVE ──────────────────────────────────────────────────────────────────
+def _frame_to_b64(frame: np.ndarray) -> str:
+    """Encode an RGB uint8 numpy array as a JPEG base64 string."""
+    import io
+    from PIL import Image
+    img = Image.fromarray(frame.astype(np.uint8))
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=85)
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+# ── PERCEIVE (public) ─────────────────────────────────────────────────────────
 
 def perceive(frame: np.ndarray, goal: str) -> dict:
     """Analyse the current RGB frame with a VLM.
 
-    Returns {target_visible, direction, distance, confidence}.
-    confidence is meaningful ONLY when target_visible=True; forced to 0.0 otherwise.
-    Retries up to 3 times when the model returns an empty text block.
+    Uses InternVL3 locally if VLN_LOCAL_MODEL is set; otherwise Anthropic API;
+    otherwise rule-based fallback.
+    Returns {target_visible, direction, confidence, room, relevance}.
+    confidence forced to 0.0 when target_visible=False.
     """
+    if _LOCAL_MODEL_PATH:
+        return _perceive_local(frame, goal)
+
     client = _get_client()
     if client is None:
         return _perceive_rule(frame, goal)
@@ -92,10 +232,8 @@ def perceive(frame: np.ndarray, goal: str) -> dict:
 
     if not text or "{" not in text:
         return _perceive_rule(frame, goal)
-
     try:
         result = json.loads(text[text.find("{"):text.rfind("}")+1])
-        # Enforce: confidence must be 0.0 when target is not visible
         if not result.get("target_visible", False):
             result["confidence"] = 0.0
             result["direction"]  = "not_visible"
@@ -104,18 +242,12 @@ def perceive(frame: np.ndarray, goal: str) -> dict:
         return _perceive_rule(frame, goal)
 
 
-
 def classify_scene(frame, goal: str) -> dict:
-    """
-    Identify current room type and visible objects (fires every ~20 steps).
+    """Identify current room type (fires every ~20 steps). API-only."""
+    if _LOCAL_MODEL_PATH:
+        # Skip heavy API call when running local model; perception is enough
+        return {"room": "other", "objects": [], "floor_hint": "unknown", "suggest": "none"}
 
-    Returns:
-        {"room": str, "objects": [str], "floor_hint": str, "suggest": str}
-        suggest: "go_upstairs" | "search_room" | "keep_exploring" | "none"
-
-    Used to annotate topo_map nodes and bias frontier selection.
-    Does NOT return target_visible — that is perceive()'s job.
-    """
     client = _get_client()
     if client is None:
         return {"room": "其他", "objects": [], "floor_hint": "unknown", "suggest": "none"}
@@ -134,7 +266,6 @@ def classify_scene(frame, goal: str) -> dict:
         f"- 若当前房间可能有{goal}但未完全扫描 → search_room\n"
         "- 其他情况 → keep_exploring"
     )
-
     text = ""
     for attempt in range(2):
         try:
@@ -165,29 +296,15 @@ def classify_scene(frame, goal: str) -> dict:
 
 def _perceive_rule(frame: np.ndarray, goal: str) -> dict:
     """Rule-based fallback: report target not visible, trust semantic-map nav."""
-    return {"target_visible": False, "direction": "not_visible", "distance": 99.0, "confidence": 0.0, "room": "other", "relevance": 0.2}
-
-
-def _frame_to_b64(frame: np.ndarray) -> str:
-    """Encode an RGB uint8 numpy array as a JPEG base64 string."""
-    import io
-    from PIL import Image
-    img = Image.fromarray(frame.astype(np.uint8))
-    buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=85)
-    return base64.b64encode(buf.getvalue()).decode()
+    return {"target_visible": False, "direction": "not_visible", "distance": 99.0,
+            "confidence": 0.0, "room": "other", "relevance": 0.2}
 
 
 # ── DIALOGUE ──────────────────────────────────────────────────────────────────
 
 class DialogueAgent:
-    """Manage user dialogue: parse Chinese goal instructions and compose replies.
+    """Manage user dialogue: parse Chinese goal instructions and compose replies."""
 
-    With an API key: uses Claude Haiku for intent extraction and reply generation.
-    Without a key:   falls back to keyword matching for goal parsing.
-    """
-
-    # Keyword → canonical goal word (used by the rule-based fallback)
     _KEYWORD_MAP = {
         "沙发": "沙发", "sofa": "沙发", "couch": "沙发",
         "床":   "床",   "bed":  "床",
@@ -215,13 +332,10 @@ class DialogueAgent:
                 resp = client.messages.create(
                     model=_MODEL_DIALOGUE,
                     max_tokens=1024,
-                    messages=[{
-                        "role": "user",
-                        "content": (
-                            f"从以下用户指令中提取导航目标（中文名词，如：沙发、床、椅子、桌子、厕所等）。"
-                            f"只返回目标词，不要其他内容。\n用户指令：{user_input}"
-                        ),
-                    }],
+                    messages=[{"role": "user", "content": (
+                        f"从以下用户指令中提取导航目标（中文名词，如：沙发、床、椅子、桌子、厕所等）。"
+                        f"只返回目标词，不要其他内容。\n用户指令：{user_input}"
+                    )}],
                 )
                 goal = _extract_text(resp.content).strip()
                 if goal:
@@ -245,10 +359,8 @@ class DialogueAgent:
                 resp = client.messages.create(
                     model=_MODEL_DIALOGUE,
                     max_tokens=1024,
-                    messages=[{
-                        "role": "user",
-                        "content": "你是家居机器人，刚刚完成导航到达目标位置，用一句简短的中文询问用户还需要什么帮助。",
-                    }],
+                    messages=[{"role": "user", "content":
+                        "你是家居机器人，刚刚完成导航到达目标位置，用一句简短的中文询问用户还需要什么帮助。"}],
                 )
                 return _extract_text(resp.content).strip()
             except Exception:

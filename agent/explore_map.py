@@ -21,7 +21,7 @@ EYE_HEIGHT   = 1.0   # must match habitat_env.py
 MAX_DEPTH    = 5.0   # metres, ignore deeper readings
 SCORE_ALPHA  = 0.4   # EMA weight when updating value map
 
-VLM_CALL_INTERVAL = 5  # call VLM every N navigation steps
+VLM_CALL_INTERVAL = 8  # call VLM every N navigation steps
 
 
 class ExploreMap:

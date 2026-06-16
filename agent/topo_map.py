@@ -19,22 +19,22 @@ from collections import defaultdict
 
 
 # ---------------------------------------------------------------------------
-# Commonsense object → room mapping (Chinese labels)
+# Commonsense object → room mapping (English room labels to match VLM output)
 # ---------------------------------------------------------------------------
 OBJECT_ROOM_MAP: Dict[str, str] = {
-    "床":    "卧室",
-    "衣柜":  "卧室",
-    "床头柜":"卧室",
-    "沙发":  "客厅",
-    "电视":  "客厅",
-    "椅子":  "客厅",
-    "冰箱":  "厨房",
-    "灶台":  "厨房",
-    "马桶":  "卫生间",
-    "浴缸":  "卫生间",
+    "床":    "bedroom",
+    "衣柜":  "bedroom",
+    "床头柜":"bedroom",
+    "沙发":  "living_room",
+    "电视":  "living_room",
+    "椅子":  "living_room",
+    "冰箱":  "kitchen",
+    "灶台":  "kitchen",
+    "马桶":  "bathroom",
+    "浴缸":  "bathroom",
 }
 
-VALID_ROOMS = ("客厅", "卧室", "走廊", "厨房", "楼梯间", "浴室", "其他")
+VALID_ROOMS = ("living_room", "bedroom", "hallway", "kitchen", "staircase", "bathroom", "other")
 
 # ---------------------------------------------------------------------------
 # Data classes
@@ -120,7 +120,7 @@ class TopoMap:
 
         floor = self._floor_from_pos(pos)
         if room not in VALID_ROOMS:
-            room = "其他"
+            room = "other"
 
         new_idx = len(self.nodes)
         node = TopoNode(
@@ -193,7 +193,7 @@ class TopoMap:
                 return {"action": "goto", "pos": closest.pos}
 
             # 3. If the target is typically upstairs and floor 1 is unexplored
-            UPSTAIRS_ROOMS = {"卧室", "浴室"}
+            UPSTAIRS_ROOMS = {"bedroom", "bathroom"}
             if target_room in UPSTAIRS_ROOMS and not self.has_explored_floor(1):
                 return {"action": "go_upstairs"}
 
@@ -271,16 +271,16 @@ class TopoMap:
 if __name__ == "__main__":
     tm = TopoMap(min_node_dist=2.5)
 
-    added = tm.add_node([0.0, 0.16, 0.0], "客厅", ["沙发", "电视"], step=0)
+    added = tm.add_node([0.0, 0.16, 0.0], "living_room", ["沙发", "电视"], step=0)
     assert added, "first node must be added"
 
-    added = tm.add_node([1.0, 0.16, 0.0], "客厅", ["椅子"], step=5)
+    added = tm.add_node([1.0, 0.16, 0.0], "living_room", ["椅子"], step=5)
     assert not added, "node within min_node_dist must be rejected"
 
-    added = tm.add_node([3.0, 0.16, 0.0], "走廊", [], step=10)
+    added = tm.add_node([3.0, 0.16, 0.0], "hallway", [], step=10)
     assert added, "node beyond min_node_dist must be added"
 
-    added = tm.add_node([0.0, 3.16, 0.0], "卧室", ["床"], step=20)
+    added = tm.add_node([0.0, 3.16, 0.0], "bedroom", ["床"], step=20)
     assert added, "upper-floor node must be added"
 
     assert tm.node_count == 3
@@ -289,8 +289,8 @@ if __name__ == "__main__":
     assert tm.has_explored_floor(0)
     assert tm.has_explored_floor(1)
 
-    node = tm.find_room_node("走廊")
-    assert node is not None and node.room == "走廊"
+    node = tm.find_room_node("hallway")
+    assert node is not None and node.room == "hallway"
 
     direction = tm.suggest_goal_direction("床", np.array([0.0, 0.16, 0.0]))
     # floor 1 has a node now, so should suggest goto
