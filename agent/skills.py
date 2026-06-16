@@ -227,10 +227,10 @@ def verify_arrival(env, nav_state: dict) -> dict:
     target_visible = percept.get("target_visible", False)
     confidence     = float(percept.get("confidence", 0.0))
 
-    # Standard 1.0m threshold.  For objects with elevated centroids (fridge,
-    # TV) the 3D dist to SNAP centroid may plateau above 1.0m even when the
-    # robot is adjacent in XZ — stagnation detection handles that case.
-    vlm_confirmed = target_visible and confidence >= 0.25 and dist <= 1.0
+    # Use 1.5m to match SUCCESS_DIST in eval.py.  Semantic.txt bounding-box
+    # centroids sit ~0.5m inside tall objects (fridge, TV), so 1.5m centroid
+    # distance corresponds to ~1.0m from the actual object surface.
+    vlm_confirmed = target_visible and confidence >= 0.25 and dist <= 1.5
 
     if vlm_confirmed:
         print(f"  [VERIFY step={step}] SUCCESS dist_to_tgt={dist:.3f}m vis={target_visible} conf={confidence:.2f} → DONE", flush=True)
@@ -262,8 +262,8 @@ def verify_arrival(env, nav_state: dict) -> dict:
                 )
             else:
                 xz_dist = dist  # fallback
-            if xz_dist <= 1.0:
-                print(f"  [VERIFY step={step}] STAGNANT dist3d={dist:.3f}m xz={xz_dist:.3f}m (elevation offset) vis=True → SUCCESS", flush=True)
+            if xz_dist <= 1.5:
+                print(f"  [VERIFY step={step}] STAGNANT dist3d={dist:.3f}m xz={xz_dist:.3f}m → SUCCESS", flush=True)
                 nav_state["done"]          = True
                 nav_state["current_skill"] = "done"
             else:
@@ -273,7 +273,7 @@ def verify_arrival(env, nav_state: dict) -> dict:
                 nav_state["waypoints"]      = []
                 nav_state["verify_stagnant"] = 0
             return nav_state
-        print(f"  [VERIFY step={step}] stepping {action_name} toward target dist={dist:.3f}m (need ≤1.0m) vis=True conf={confidence:.2f}", flush=True)
+        print(f"  [VERIFY step={step}] stepping {action_name} toward target dist={dist:.3f}m (need ≤1.5m) vis=True conf={confidence:.2f}", flush=True)
         frame, _ = env.step(step_action)
         nav_state["last_frame"]  = frame
         nav_state["step_count"] += 1

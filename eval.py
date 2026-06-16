@@ -35,7 +35,7 @@ from agent.semantic_map import query_target  # EVALUATION ONLY — not used by a
 # Constants
 # ---------------------------------------------------------------------------
 
-SUCCESS_DIST = 1.0           # metres
+SUCCESS_DIST = 1.5           # metres (bounding-box centroids overestimate dist by ~0.5m for tall objects)
 DATA_DIR     = Path("/data3/liangjy/vln/data/hm3d")
 DEFAULT_SCENE = str(DATA_DIR / "00800-TEEsavR23oF")
 
