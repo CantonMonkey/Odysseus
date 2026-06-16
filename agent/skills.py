@@ -227,10 +227,10 @@ def verify_arrival(env, nav_state: dict) -> dict:
     target_visible = percept.get("target_visible", False)
     confidence     = float(percept.get("confidence", 0.0))
 
-    # SNAP centroid may be at object centre height (e.g. fridge ~1m off floor),
-    # so 3D dist plateaus at ~1.2-1.5m even when the robot is adjacent.  Raise
-    # the success threshold to 1.5m; stagnation detection handles the rest.
-    vlm_confirmed = target_visible and confidence >= 0.25 and dist <= 1.5
+    # Standard 1.0m threshold.  For objects with elevated centroids (fridge,
+    # TV) the 3D dist to SNAP centroid may plateau above 1.0m even when the
+    # robot is adjacent in XZ — stagnation detection handles that case.
+    vlm_confirmed = target_visible and confidence >= 0.25 and dist <= 1.0
 
     if vlm_confirmed:
         print(f"  [VERIFY step={step}] SUCCESS dist_to_tgt={dist:.3f}m vis={target_visible} conf={confidence:.2f} → DONE", flush=True)
@@ -243,18 +243,37 @@ def verify_arrival(env, nav_state: dict) -> dict:
         angle, turn_action = _turn_to(forward, to_target)
         step_action = ACTION_FORWARD if angle < ALIGN_THRESH else turn_action
         action_name = "FORWARD" if step_action == ACTION_FORWARD else "TURN"
-        # Stagnation: robot is physically blocked by the object — declare success.
+        # Stagnation: robot physically blocked (often by elevated-centroid objects).
+        # Check XZ-only distance to nearest instance:
+        #   ≤ 1.0m → we're adjacent (stagnation due to elevation) → SUCCESS
+        #   > 1.0m → truly too far → abandon target, revert to explore
         last_vd = nav_state.get("verify_last_dist", dist + 1.0)
         vstag   = nav_state.get("verify_stagnant", 0)
         vstag   = vstag + 1 if dist >= last_vd - 0.05 else 0
         nav_state["verify_last_dist"] = dist
         nav_state["verify_stagnant"]  = vstag
         if vstag >= 8:
-            print(f"  [VERIFY step={step}] STAGNANT {vstag} steps dist={dist:.3f}m (blocked by object) vis=True → SUCCESS", flush=True)
-            nav_state["done"]          = True
-            nav_state["current_skill"] = "done"
+            instances = nav_state.get("target_instances", [])
+            if instances:
+                rx, rz = float(robot_pos[0]), float(robot_pos[2])
+                xz_dist = min(
+                    np.sqrt((float(p[0])-rx)**2 + (float(p[2])-rz)**2)
+                    for p in instances
+                )
+            else:
+                xz_dist = dist  # fallback
+            if xz_dist <= 1.0:
+                print(f"  [VERIFY step={step}] STAGNANT dist3d={dist:.3f}m xz={xz_dist:.3f}m (elevation offset) vis=True → SUCCESS", flush=True)
+                nav_state["done"]          = True
+                nav_state["current_skill"] = "done"
+            else:
+                print(f"  [VERIFY step={step}] STAGNANT dist3d={dist:.3f}m xz={xz_dist:.3f}m (too far) → revert explore", flush=True)
+                nav_state["target_pos"]     = None
+                nav_state["current_skill"]  = "explore_frontier"
+                nav_state["waypoints"]      = []
+                nav_state["verify_stagnant"] = 0
             return nav_state
-        print(f"  [VERIFY step={step}] stepping {action_name} toward target dist={dist:.3f}m (need ≤1.5m) vis=True conf={confidence:.2f}", flush=True)
+        print(f"  [VERIFY step={step}] stepping {action_name} toward target dist={dist:.3f}m (need ≤1.0m) vis=True conf={confidence:.2f}", flush=True)
         frame, _ = env.step(step_action)
         nav_state["last_frame"]  = frame
         nav_state["step_count"] += 1
