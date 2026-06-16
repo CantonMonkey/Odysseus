@@ -45,6 +45,19 @@ def _inst_dist(robot_pos, instances):
         for p in instances
     ))
 
+
+def _pathfinder_reachable(env, robot_pos: np.ndarray, target_pos: np.ndarray) -> bool:
+    """Return True if pathfinder can find a path from robot to target."""
+    import habitat_sim
+    pf = env._sim.pathfinder
+    snapped = pf.snap_point(target_pos.astype(np.float32))
+    if np.any(np.isnan(snapped)):
+        return False
+    path = habitat_sim.ShortestPath()
+    path.requested_start = robot_pos.astype(np.float32)
+    path.requested_end   = snapped
+    return pf.find_path(path) and len(path.points) > 1
+
 def _log(msg: str):
     print(msg, flush=True)
 
@@ -345,13 +358,31 @@ def run_task(
                             pool = [p for p in pool if (round(float(p[0]),1), round(float(p[2]),1)) not in blacklisted]
 
                             if pool:
-                                nearest  = min(pool, key=lambda p: float(np.linalg.norm(p - robot_pos)))
+                                # Sort by XZ distance; check pathfinder reachability for
+                                # the top-8 nearest candidates (proactive, not reactive).
+                                pool_sorted = sorted(pool, key=lambda p: float(np.linalg.norm(p - robot_pos)))
+                                nearest = None
+                                new_bl  = []
+                                for cand in pool_sorted[:8]:
+                                    cand_arr = np.array([float(cand[0]), float(tgt[1]), float(cand[2])], dtype=np.float32)
+                                    if _pathfinder_reachable(env, robot_pos, cand_arr):
+                                        nearest = cand
+                                        break
+                                    else:
+                                        key = (round(float(cand[0]), 1), round(float(cand[2]), 1))
+                                        new_bl.append(key)
+                                # Blacklist unreachable candidates found during proactive check
+                                if new_bl:
+                                    nav_state.setdefault("blacklisted_snap", set()).update(new_bl)
+                                    blacklisted = nav_state["blacklisted_snap"]
+                                if nearest is None:
+                                    nearest = pool_sorted[0]  # fall back to nearest
                                 snapped  = np.array([float(nearest[0]), float(tgt[1]), float(nearest[2])], dtype=np.float32)
                                 snap_dist = float(np.linalg.norm(snapped - robot_pos))
                                 stats["snap_events"] += 1
                                 _log(f"  [SNAP step={step}] "
                                      f"pool={len(pool)} (same_floor={len(same_floor)}/{len(inst_list)} nearby={len(nearby)} blacklisted={len(blacklisted)}) "
-                                     f"→ chosen=({nearest[0]:.2f},{nearest[2]:.2f}) "
+                                     f"new_bl={len(new_bl)} → chosen=({nearest[0]:.2f},{nearest[2]:.2f}) "
                                      f"robot_dist={snap_dist:.1f}m "
                                      f"depth_est=({tgt[0]:.2f},{tgt[2]:.2f})")
                                 tgt = snapped
