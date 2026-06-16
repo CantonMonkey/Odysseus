@@ -376,9 +376,7 @@ def run_task(
                         _tag = "UNEXP" if (explore_map._valid(gi, gj) and explore_map.grid[gi, gj] == 0) else "EXP"
                         nav_state["frontier_pos"] = rp_list
                         nav_state["waypoints"] = wps
-                        # Blacklist current stuck frontiers so robot can't return to old area
-                        _stuck_frontiers = set(tuple(c) for c in explore_map.frontiers())
-                        nav_state["failed_frontiers"] = nav_state.get("failed_frontiers", set()) | _stuck_frontiers
+                        nav_state["failed_frontiers"] = set()  # clear so new area gets full exploration
                         nav_state["stagnant_steps"] = 0
                         nav_state["last_expl"] = explore_map.explored_fraction()
                         nav_state["explore_anchor"] = rp_list
