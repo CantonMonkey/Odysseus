@@ -291,11 +291,26 @@ def verify_arrival(env, nav_state: dict) -> dict:
             if scanned % 3 == 0:
                 nav_state["vlm_step"] = nav_state["step_count"] - 8
         else:
-            print(f"  [VERIFY step={step}] 360° scan complete, target NOT found → revert to explore (depth estimate wrong)", flush=True)
-            nav_state["target_pos"]     = None
-            nav_state["current_skill"]  = "explore_frontier"
-            nav_state["waypoints"]      = []
-            nav_state["verify_scanned"] = 0
+            # Check XZ dist before giving up — robot may be adjacent but VLM can't see it.
+            instances = nav_state.get("target_instances", [])
+            if instances:
+                rx, rz = float(robot_pos[0]), float(robot_pos[2])
+                xz_near = min(
+                    np.sqrt((float(p[0])-rx)**2 + (float(p[2])-rz)**2)
+                    for p in instances
+                )
+            else:
+                xz_near = dist
+            if xz_near <= 1.5:
+                print(f"  [VERIFY step={step}] 360° scan, NOT found BUT xz={xz_near:.3f}m ≤ 1.5m → SUCCESS", flush=True)
+                nav_state["done"]          = True
+                nav_state["current_skill"] = "done"
+            else:
+                print(f"  [VERIFY step={step}] 360° scan complete, target NOT found → revert to explore", flush=True)
+                nav_state["target_pos"]     = None
+                nav_state["current_skill"]  = "explore_frontier"
+                nav_state["waypoints"]      = []
+                nav_state["verify_scanned"] = 0
     else:
         print(f"  [VERIFY step={step}] dist={dist:.3f}m > ARRIVE_DIST={ARRIVE_DIST}m → back to follow_path", flush=True)
         nav_state["current_skill"] = "follow_path"
