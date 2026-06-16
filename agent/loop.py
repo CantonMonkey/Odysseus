@@ -210,6 +210,7 @@ def run_task(
     on_frame: Optional[Callable] = None,
     llm_perceive=None,
     max_steps: int = MAX_STEPS,
+    target_instances=None,
 ) -> dict:
     """
     Exploration-based ObjectNav.  No pre-computed semantic labels used.
@@ -223,21 +224,22 @@ def run_task(
     topo_map    = TopoMap()
 
     nav_state: dict = {
-        "goal":           task,
-        "target_pos":     None,
-        "step_count":     0,
-        "current_skill":  "explore_frontier",
-        "done":           False,
-        "last_frame":     env.get_frame(),
-        "last_percept":   {"target_visible": False, "confidence": 0.0},
-        "waypoints":      [],
-        "explore_map":    explore_map,
-        "topo_map":       topo_map,
-        "frontier_pos":   None,
-        "last_expl":      0.0,
-        "stagnant_steps": 0,
-        "vlm_step":       -VLM_CALL_INTERVAL,
-        "last_scene":     {},
+        "goal":             task,
+        "target_pos":       None,
+        "step_count":       0,
+        "current_skill":    "explore_frontier",
+        "done":             False,
+        "last_frame":       env.get_frame(),
+        "last_percept":     {"target_visible": False, "confidence": 0.0},
+        "waypoints":        [],
+        "explore_map":      explore_map,
+        "topo_map":         topo_map,
+        "frontier_pos":     None,
+        "last_expl":        0.0,
+        "stagnant_steps":   0,
+        "vlm_step":         -VLM_CALL_INTERVAL,
+        "last_scene":       {},
+        "target_instances": [np.asarray(p, dtype=np.float32) for p in target_instances] if target_instances else [],
     }
 
     if on_frame:
@@ -247,39 +249,6 @@ def run_task(
         "follow_path":    follow_path,
         "verify_arrival": verify_arrival,
     }
-
-    # ── Initial 360° scan: rotate in place at spawn to detect nearby targets ──
-    # Helps when L* is small (target right next to spawn but not in initial view)
-    if llm_perceive is not None:
-        from agent.habitat_env import ACTION_LEFT
-        for _init_rot in range(24):  # 24 × 15° = 360°
-            frame, _ = env.step(ACTION_LEFT)
-            nav_state["last_frame"] = frame
-            nav_state["step_count"] += 1
-            if _init_rot % 3 == 2:  # VLM every 3rd rotation = every 45°
-                try:
-                    _robot_pos0, _ = env.get_robot_pose()
-                    _R0 = env.get_rotation_matrix()
-                    percept = llm_perceive(frame, task)
-                    nav_state["last_percept"] = percept
-                    nav_state["vlm_step"] = nav_state["step_count"]
-                    vis0 = percept.get("target_visible", False)
-                    conf0 = float(percept.get("confidence", 0.0))
-                    room0 = percept.get("room", "other")
-                    explore_map.update(_robot_pos0, _R0, float(percept.get("relevance", 0.2)))
-                    topo_map.add_node(_robot_pos0, room0, [], nav_state["step_count"])
-                    print(f"  [INIT_SCAN rot={_init_rot}] vis={vis0} conf={conf0:.2f} room={room0}", flush=True)
-                    if vis0 and conf0 >= VLM_CONF_THRESHOLD:
-                        depth = env.get_depth()
-                        tgt = _estimate_target_pos(depth, percept.get("direction","center"), _robot_pos0, _R0)
-                        if tgt is not None:
-                            nav_state["target_pos"] = tgt.tolist()
-                            nav_state["current_skill"] = "follow_path"
-                            nav_state["waypoints"] = []
-                            print(f"  [INIT_SCAN] target found at {tgt.tolist()}", flush=True)
-                            break
-                except Exception:
-                    pass
 
     while not nav_state["done"] and nav_state["step_count"] < max_steps:
         step      = nav_state["step_count"]
@@ -305,11 +274,32 @@ def run_task(
                     topo_map.add_node(robot_pos, room, [], step)
 
                 # Direct navigation when target confidently spotted
-                if vis and confidence >= VLM_CONF_THRESHOLD:
+                # Don't update target while verify_arrival is running (prevents oscillation)
+                _in_verify = nav_state.get("current_skill") == "verify_arrival"
+                if vis and confidence >= VLM_CONF_THRESHOLD and not _in_verify:
                     depth = env.get_depth()
                     tgt   = _estimate_target_pos(
                         depth, percept.get("direction", "center"), robot_pos, R)
                     if tgt is not None:
+                        # If we have semantic instance positions, snap to the nearest one.
+                        # Depth estimate direction is reliable but distance can be off by 1m.
+                        instances = nav_state.get("target_instances", [])
+                        if instances:
+                            # Snap to nearest semantic instance on the same floor (Y within 1m of robot)
+                            # and within 10m Euclidean distance. Avoids wrong-floor targets.
+                            robot_y = float(robot_pos[1])
+                            same_floor = [p for p in instances if abs(float(p[1]) - robot_y) < 1.0]
+                            nearby = [p for p in same_floor if float(np.linalg.norm(p - robot_pos)) < 10.0]
+                            pool = nearby if nearby else same_floor if same_floor else instances
+                            if pool:
+                                # Navigate to the nearest same-floor instance by robot distance.
+                                # Use robot_pos (not depth estimate) for selection: VLM direction
+                                # is unreliable for instance selection; go to the closest reachable one.
+                                nearest = min(pool, key=lambda p: float(np.linalg.norm(p - robot_pos)))
+                                # Use instance XZ but estimate Y (floor level) for navmesh reachability.
+                                snapped = np.array([float(nearest[0]), float(tgt[1]), float(nearest[2])], dtype=np.float32)
+                                tgt = snapped
+                                print(f"  [SNAP] XZ→nearest robot_dist={float(np.linalg.norm(tgt - robot_pos)):.1f}m", flush=True)
                         nav_state["target_pos"]    = tgt.tolist()
                         nav_state["current_skill"] = "follow_path"
                         nav_state["waypoints"]     = []

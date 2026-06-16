@@ -162,6 +162,7 @@ def _run_episode(
             on_frame=None,
             llm_perceive=llm_perceive,
             max_steps=max_steps,
+            target_instances=instances,
         )
     finally:
         env.step = _original_step  # restore

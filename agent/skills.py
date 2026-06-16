@@ -16,7 +16,7 @@ try:
 except ImportError:
     _HAS_QUATERNION = False
 
-ARRIVE_DIST  = 1.2   # goal-reached threshold (m)
+ARRIVE_DIST  = 2.0   # goal-reached threshold (m)
 ALIGN_THRESH = 12.0  # heading alignment threshold before moving forward (deg)
 WP_REACH     = 0.4   # waypoint-reached threshold (m)
 
@@ -177,21 +177,61 @@ def search_room(env, nav_state: dict) -> dict:
 # ── Skill 3: verify_arrival ─────────────────────────────────────
 
 def verify_arrival(env, nav_state: dict) -> dict:
-    """Confirm arrival: Euclidean distance < ARRIVE_DIST, or LLM says so."""
+    """Confirm arrival at goal.
+
+    Success: VLM confirms target visible while within ARRIVE_DIST of estimate,
+    or robot is within 0.8m of estimate and VLM sees it.
+    If arrived but VLM doesn't see the target even after scanning, depth
+    estimate was wrong — revert to explore.
+    """
     robot_pos, _ = env.get_robot_pose()
     target_pos   = nav_state.get("target_pos")
     dist = _euclidean(robot_pos, target_pos) if target_pos else float("inf")
 
-    percept      = nav_state.get("last_percept", {})
+    percept        = nav_state.get("last_percept", {})
     target_visible = percept.get("target_visible", False)
-    percept_dist   = percept.get("distance", float("inf"))
+    confidence     = float(percept.get("confidence", 0.0))
 
-    arrived = dist <= ARRIVE_DIST or (target_visible and percept_dist <= ARRIVE_DIST)
+    # Success: within 0.8m of estimate AND VLM confirms target visible
+    # Tight threshold: estimate can be 0.5-1m off from actual object
+    vlm_confirmed = target_visible and confidence >= 0.25 and dist <= 0.8
 
-    if arrived:
+    if vlm_confirmed:
+        # Success confirmed: declare done (robot is within 0.8m of instance)
         nav_state["done"]          = True
         nav_state["current_skill"] = "done"
+    elif dist <= ARRIVE_DIST and target_visible and confidence >= 0.25:
+        # Visible but not close enough yet (0.8m < dist <= 2.0m): step toward target
+        # Cannot delegate to follow_path (it would immediately bounce back here)
+        from agent.habitat_env import ACTION_FORWARD, ACTION_LEFT
+        to_target = np.array(target_pos) - robot_pos
+        forward = _get_forward(env)
+        angle, turn_action = _turn_to(forward, to_target)
+        step_action = ACTION_FORWARD if angle < ALIGN_THRESH else turn_action
+        frame, _ = env.step(step_action)
+        nav_state["last_frame"]  = frame
+        nav_state["step_count"] += 1
+        nav_state["verify_scanned"] = 0
+    elif dist <= ARRIVE_DIST and not target_visible:
+        # Scan: rotate to try to re-acquire the target before giving up
+        scanned = nav_state.get("verify_scanned", 0)
+        if scanned < 24:  # full 360° scan (24 × 15° rotations)
+            from agent.habitat_env import ACTION_LEFT
+            frame, _ = env.step(ACTION_LEFT)
+            nav_state["last_frame"]     = frame
+            nav_state["step_count"]    += 1
+            nav_state["verify_scanned"] = scanned + 1
+            # Trigger VLM every 3rd rotation (every 45°) to balance speed vs coverage
+            if scanned % 3 == 0:
+                nav_state["vlm_step"] = nav_state["step_count"] - 8
+        else:
+            # Full 360° scan done, target not found — depth estimate was wrong
+            nav_state["target_pos"]     = None
+            nav_state["current_skill"]  = "explore_frontier"
+            nav_state["waypoints"]      = []
+            nav_state["verify_scanned"] = 0
     else:
         nav_state["current_skill"] = "follow_path"
+        nav_state["verify_scanned"] = 0
 
     return nav_state
