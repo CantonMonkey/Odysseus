@@ -135,7 +135,15 @@ def _explore_frontier(env, nav_state: dict, explore_map: ExploreMap,
 
         if action_type == "goto":
             target = hint["pos"]
-            _log(f"  [FRONTIER step={step}] topo_hint=goto → known room node at ({target[0]:.1f},{target[2]:.1f})")
+            # Skip if robot is already at the goto target (prevents infinite self-loop).
+            if _euclidean(robot_pos, np.array(target)) < ARRIVE_DIST:
+                gi2, gj2 = explore_map._w2g(float(np.array(target)[0]), float(np.array(target)[2]))
+                failed.add((gi2, gj2))
+                nav_state["failed_frontiers"] = failed
+                _log(f"  [FRONTIER step={step}] topo_hint=goto → already at node ({target[0]:.1f},{target[2]:.1f}), skip → value-map")
+                target = None
+            else:
+                _log(f"  [FRONTIER step={step}] topo_hint=goto → known room node at ({target[0]:.1f},{target[2]:.1f})")
         elif action_type == "go_upstairs":
             stair = topo_map.find_staircase_approach(env, robot_pos)
             if stair is not None:
