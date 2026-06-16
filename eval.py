@@ -19,6 +19,7 @@ import numpy as np
 import habitat_sim
 from pathlib import Path
 from typing import List, Optional, Dict, Any
+import json
 from collections import defaultdict
 
 # Project root on the server
@@ -93,6 +94,7 @@ def _run_episode(
     max_steps: int,
     use_vlm: bool,
     episode_idx: int,
+    spawn_pos: Optional[np.ndarray] = None,
 ) -> Optional[Dict[str, Any]]:
     """Run one episode and return metrics, or None if episode is unreachable.
 
@@ -111,8 +113,8 @@ def _run_episode(
     goal             : str
     episode          : int
     """
-    # 1. Spawn at a random ground-floor position
-    frame = env.reset(scene_dir)
+    # 1. Spawn at a random ground-floor position (or fixed if spawn_pos given)
+    frame = env.reset(scene_dir, start_pos=spawn_pos)
     start_pos, _ = env.get_robot_pose()
 
     # 2. Compute L* = geodesic distance from start to nearest instance
@@ -200,6 +202,7 @@ def _run_episode(
         "steps":           steps,
         "goal":            goal,
         "episode":         episode_idx,
+        "spawn_pos":       start_pos.tolist(),
     }
 
 
@@ -213,6 +216,7 @@ def run_evaluation(
     n_episodes_per_goal: int = 3,
     max_steps: int = 200,
     use_vlm: bool = True,
+    spawn_positions: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Run ObjectNav evaluation and return aggregated metrics.
 
@@ -254,6 +258,12 @@ def run_evaluation(
         skipped = 0
         for ep_idx in range(n_episodes_per_goal):
             try:
+                _spawn = (
+                    np.asarray(spawn_positions[goal][ep_idx], dtype=np.float32)
+                    if spawn_positions and goal in spawn_positions
+                        and ep_idx < len(spawn_positions[goal])
+                    else None
+                )
                 ep_result = _run_episode(
                     env=env,
                     scene_dir=scene_dir,
@@ -262,6 +272,7 @@ def run_evaluation(
                     max_steps=max_steps,
                     use_vlm=use_vlm,
                     episode_idx=ep_idx,
+                    spawn_pos=_spawn,
                 )
             except Exception as _e:
                 print(f"    [error] ep={ep_idx}: {_e}")
@@ -307,10 +318,19 @@ def run_evaluation(
             "n_episodes": 0, "n_skipped": 0,
         }
 
+    # Collect spawn positions (for saving to file)
+    collected_spawns: Dict[str, Any] = {}
+    for ep in all_episodes:
+        g = ep["goal"]
+        if g not in collected_spawns:
+            collected_spawns[g] = []
+        collected_spawns[g].append(ep["spawn_pos"])
+
     return {
-        "per_goal": per_goal,
-        "overall":  overall,
-        "episodes": all_episodes,
+        "per_goal":      per_goal,
+        "overall":       overall,
+        "episodes":      all_episodes,
+        "spawn_positions": collected_spawns,
     }
 
 
@@ -375,15 +395,27 @@ if __name__ == "__main__":
                         help="Chinese goal keywords")
     parser.add_argument("--episodes", type=int, default=3,
                         help="Episodes per goal")
-    parser.add_argument("--max-steps", type=int, default=200,
+    parser.add_argument("--max-steps", type=int, default=500,
                         help="Maximum navigation steps per episode")
     parser.add_argument("--no-vlm", action="store_true",
                         help="Disable VLM perception (blind agent)")
+    parser.add_argument("--spawn-file", default=None,
+                        help="JSON file of fixed spawn positions. Load if exists, save if not.")
     args = parser.parse_args()
 
     print(f"Scene   : {args.scene}")
     print(f"Goals   : {args.goals}")
     print(f"Eps/goal: {args.episodes}  max_steps: {args.max_steps}  vlm: {not args.no_vlm}")
+
+    spawn_positions = None
+    if args.spawn_file:
+        from pathlib import Path as _Path
+        _sp = _Path(args.spawn_file)
+        if _sp.exists():
+            spawn_positions = json.loads(_sp.read_text())
+            print(f"Loaded spawn positions from {args.spawn_file}")
+        else:
+            print(f"No spawn file found at {args.spawn_file} — will generate and save")
 
     results = run_evaluation(
         scene_dir=args.scene,
@@ -391,5 +423,11 @@ if __name__ == "__main__":
         n_episodes_per_goal=args.episodes,
         max_steps=args.max_steps,
         use_vlm=not args.no_vlm,
+        spawn_positions=spawn_positions,
     )
+
+    if args.spawn_file and spawn_positions is None:
+        from pathlib import Path as _Path
+        _Path(args.spawn_file).write_text(json.dumps(results["spawn_positions"], indent=2))
+        print(f"Saved spawn positions to {args.spawn_file}")
     print_results(results)
