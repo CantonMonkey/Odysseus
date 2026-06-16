@@ -32,10 +32,18 @@ SCENE_DIR = str(_DATA / "00800-TEEsavR23oF")
 # ── Logging helpers ──────────────────────────────────────────────────────────
 
 def _inst_dist(robot_pos, instances):
-    """Euclidean distance from robot to nearest semantic instance."""
+    """Horizontal (XZ) Euclidean distance to nearest semantic instance.
+
+    Matches the metric in eval.py: uses XZ-only so tall objects (fridge, TV)
+    with elevated bounding-box centroids don't inflate the distance.
+    """
     if not instances:
         return None
-    return float(min(np.linalg.norm(p - robot_pos) for p in instances))
+    rx, rz = float(robot_pos[0]), float(robot_pos[2])
+    return float(min(
+        np.sqrt((float(p[0]) - rx) ** 2 + (float(p[2]) - rz) ** 2)
+        for p in instances
+    ))
 
 def _log(msg: str):
     print(msg, flush=True)

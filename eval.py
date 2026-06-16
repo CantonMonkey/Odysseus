@@ -75,11 +75,18 @@ def _nearest_geodesic(
 
 
 def _nearest_euclidean(robot_pos: np.ndarray, instances: List[np.ndarray]) -> float:
-    """Return the Euclidean distance to the nearest instance."""
+    """Return the horizontal (XZ) Euclidean distance to the nearest instance.
+
+    Uses XZ-only distance so that tall objects (fridge, TV) whose bounding-box
+    centroid is elevated above the floor don't inflate the metric.
+    """
     if not instances:
         return float("inf")
-    robot = np.asarray(robot_pos, dtype=np.float32)
-    return float(min(np.linalg.norm(np.asarray(p) - robot) for p in instances))
+    rx, rz = float(robot_pos[0]), float(robot_pos[2])
+    return float(min(
+        np.sqrt((float(p[0]) - rx) ** 2 + (float(p[2]) - rz) ** 2)
+        for p in instances
+    ))
 
 
 # ---------------------------------------------------------------------------
