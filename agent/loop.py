@@ -229,6 +229,22 @@ def _explore_frontier(env, nav_state: dict, explore_map: ExploreMap,
     nav_state["waypoints"]   = waypoints
     nav_state["last_frame"]  = frame
     nav_state["step_count"] += 1
+
+    # Position stagnation: if robot didn't move physically (wall collision),
+    # clear frontier so a new one is chosen next step.
+    prev_pos   = nav_state.get("expl_prev_pos")
+    stuck_cnt  = nav_state.get("expl_stuck_steps", 0)
+    moved      = float(np.linalg.norm(new_pos - np.array(prev_pos))) if prev_pos is not None else 1.0
+    stuck_cnt  = stuck_cnt + 1 if moved < 0.05 else 0
+    nav_state["expl_prev_pos"]    = new_pos.tolist()
+    nav_state["expl_stuck_steps"] = stuck_cnt
+    if stuck_cnt >= 15 and nav_state.get("frontier_pos"):
+        nav_state["frontier_pos"]     = None
+        nav_state["waypoints"]        = []
+        nav_state["expl_stuck_steps"] = 0
+        step_n = nav_state.get("step_count", "?")
+        _log(f"  [FRONTIER step={step_n}] pos-stuck {stuck_cnt} steps → clear frontier + reselect")
+
     return nav_state
 
 
