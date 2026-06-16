@@ -301,6 +301,23 @@ def run_task(
         current_skill = nav_state.get("current_skill", "explore_frontier")
         stats["skill_steps"][current_skill] = stats["skill_steps"].get(current_skill, 0) + 1
 
+        # ── Proximity trigger: if adjacent to an instance with no target, go verify ─
+        if (nav_state.get("target_pos") is None
+                and current_skill not in ("verify_arrival", "done")
+                and instances):
+            _idist_prox = _inst_dist(robot_pos, instances)
+            if _idist_prox is not None and _idist_prox <= ARRIVE_DIST:
+                rx, rz = float(robot_pos[0]), float(robot_pos[2])
+                nearest_inst = min(instances,
+                                   key=lambda p: (float(p[0])-rx)**2 + (float(p[2])-rz)**2)
+                nav_state["target_pos"]    = [float(nearest_inst[0]),
+                                               float(robot_pos[1]),
+                                               float(nearest_inst[2])]
+                nav_state["current_skill"] = "verify_arrival"
+                _log(f"  [PROXIMITY step={step}] inst_dist={_idist_prox:.2f}m ≤ {ARRIVE_DIST}m "
+                     f"→ verify_arrival at ({nearest_inst[0]:.2f},{nearest_inst[2]:.2f})")
+                current_skill = "verify_arrival"
+
         # ── Log skill transitions ──────────────────────────────────────
         if current_skill != prev_skill:
             idist = _inst_dist(robot_pos, instances)
