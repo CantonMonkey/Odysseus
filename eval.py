@@ -190,7 +190,8 @@ def _run_episode(
 
     print(
         f"    ep={episode_idx} success={success} "
-        f"dist={dist_to_nearest:.2f}m spl={spl:.3f} steps={steps}"
+        f"dist={dist_to_nearest:.2f}m L*={L_star:.1f}m spl={spl:.3f} steps={steps} "
+        f"spawn=({start_pos[0]:.1f},{start_pos[2]:.1f})"
     )
     return {
         "success":         success,

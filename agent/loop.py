@@ -349,7 +349,7 @@ def run_task(
                         nav_state["last_expl"] = explore_map.explored_fraction()
                         nav_state["explore_anchor"] = rp_list
                         nav_state["anchor_steps_left"] = 80
-                        print(f"  [ESCAPE step={step}] {_tag} dist={best_dist:.1f}m", flush=True)
+                        print(f"  [ESCAPE step={step}] {_tag} dist={best_dist:.1f}m robot=({robot_pos[0]:.1f},{robot_pos[2]:.1f}) tgt=({rp_list[0]:.1f},{rp_list[2]:.1f})", flush=True)
                     else:
                         # Truly stuck in isolated navmesh island — just rotate
                         nav_state["stagnant_steps"] = 0
