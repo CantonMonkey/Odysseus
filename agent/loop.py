@@ -98,6 +98,7 @@ def _explore_frontier(env, nav_state: dict, explore_map: ExploreMap,
         nav_state["failed_frontiers"] = failed
         nav_state["frontier_pos"] = None
         nav_state["waypoints"]    = []
+        nav_state["escape_in_progress"] = False  # Reached escape destination
 
     # Need a new frontier target
     if not nav_state.get("frontier_pos") or not nav_state.get("waypoints"):
@@ -290,7 +291,7 @@ def run_task(
 
         # ── Stagnation detection: escape if exploration stuck ──────────
         if current_skill_pre := nav_state.get("current_skill", "explore_frontier"):
-            if current_skill_pre == "explore_frontier":
+            if current_skill_pre == "explore_frontier" and not nav_state.get("escape_in_progress", False):
                 cur_expl = explore_map.explored_fraction()
                 if abs(cur_expl - nav_state.get("last_expl", 0.0)) < 0.001:
                     nav_state["stagnant_steps"] = nav_state.get("stagnant_steps", 0) + 1
