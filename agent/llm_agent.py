@@ -44,66 +44,68 @@ def _extract_text(content_blocks) -> str:
 # ── PERCEIVE ──────────────────────────────────────────────────────────────────
 
 def perceive(frame: np.ndarray, goal: str) -> dict:
-    """Analyse the current RGB frame with Claude Vision.
+    """Analyse the current RGB frame with a VLM.
 
-    Returns {"target_visible": bool, "direction": str, "distance": float}.
-
-    Without an API key the rule fallback always returns target_visible=False,
-    meaning the control loop relies entirely on the semantic-map coordinates
-    for navigation.
+    Returns {target_visible, direction, distance, confidence}.
+    confidence is meaningful ONLY when target_visible=True; forced to 0.0 otherwise.
+    Retries up to 3 times when the model returns an empty text block.
     """
     client = _get_client()
     if client is None:
         return _perceive_rule(frame, goal)
 
+    import json, time
+    img_b64 = _frame_to_b64(frame)
+    prompt = (
+        "你是家居导航机器人的视觉感知模块。\n"
+        f"导航目标：{goal}\n"
+        "观察第一视角图像，只返回一行JSON，禁止其他文字:\n"
+        '{"target_visible":bool,"direction":"left|center|right|not_visible",'
+        '"distance":float,"confidence":float}\n'
+        "规则:\n"
+        "- target_visible=true: 目标在画面中可见\n"
+        "- confidence: 仅target_visible=true时填识别把握(0.0-1.0)，否则必须填0.0\n"
+        "- distance: 目标估计距离(米)，不可见填99\n"
+        "- direction: 不可见填not_visible"
+    )
+
+    text = ""
+    for attempt in range(3):
+        try:
+            response = client.messages.create(
+                model=_MODEL_PERCEIVE,
+                max_tokens=128,
+                messages=[{"role": "user", "content": [
+                    {"type": "image", "source": {
+                        "type": "base64", "media_type": "image/jpeg", "data": img_b64}},
+                    {"type": "text", "text": prompt},
+                ]}],
+            )
+            text = _extract_text(response.content).strip()
+            if text and "{" in text:
+                break
+        except Exception:
+            pass
+        if attempt < 2:
+            time.sleep(0.3)
+
+    if not text or "{" not in text:
+        return _perceive_rule(frame, goal)
+
     try:
-        img_b64 = _frame_to_b64(frame)
-        # Prompt is in Chinese to match the robot's conversational language
-        response = client.messages.create(
-            model=_MODEL_PERCEIVE,
-            max_tokens=512,
-            messages=[{
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": "image/jpeg",
-                            "data": img_b64,
-                        },
-                    },
-                    {
-                        "type": "text",
-                        "text": (
-                            f"你是一个家居导航机器人的视觉感知模块。\n"
-                            f"当前导航目标：{goal}\n"
-                            f"请观察这张机器人第一视角图像，判断：\n"
-                            f"1. 目标物体是否在视野内（target_visible: true/false）\n"
-                            f"2. 目标大致方向（direction: left/center/right/not_visible）\n"
-                            f"3. 估计距离（distance: 米，不可见时填 99）\n"
-                            f"只返回 JSON，格式：{{\"target_visible\": bool, "
-                            f"\"direction\": str, \"distance\": float, "
-                            f"\"confidence\": float}}  "
-                            f"confidence 是 0-1 的浮点数，表示目标在视野中的把握程度，"
-                            f"目标不可见时为 0.0。"
-                        ),
-                    },
-                ],
-            }],
-        )
-        import json
-        text  = _extract_text(response.content).strip()
-        start = text.find("{")
-        end   = text.rfind("}") + 1
-        return json.loads(text[start:end])
+        result = json.loads(text[text.find("{"):text.rfind("}")+1])
+        # Enforce: confidence must be 0.0 when target is not visible
+        if not result.get("target_visible", False):
+            result["confidence"] = 0.0
+            result["direction"]  = "not_visible"
+        return result
     except Exception:
         return _perceive_rule(frame, goal)
 
 
 def _perceive_rule(frame: np.ndarray, goal: str) -> dict:
     """Rule-based fallback: report target not visible, trust semantic-map nav."""
-    return {"target_visible": False, "direction": "not_visible", "distance": 99.0}
+    return {"target_visible": False, "direction": "not_visible", "distance": 99.0, "confidence": 0.0}
 
 
 def _frame_to_b64(frame: np.ndarray) -> str:

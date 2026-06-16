@@ -22,6 +22,7 @@ from agent.explore_map import ExploreMap, VLM_CALL_INTERVAL
 MAX_STEPS  = 300
 ARRIVE_DIST = 1.2
 VLM_CONF_THRESHOLD = 0.55   # confidence above this → treat target as found
+HINT_INTERVAL      = 40     # ask spatial-reasoning LLM every N steps
 
 # Default scene — overridden by server/main.py at startup
 from pathlib import Path
@@ -138,6 +139,65 @@ def _explore_frontier(env, nav_state: dict, explore_map: ExploreMap) -> dict:
     return nav_state
 
 
+# ── spatial reasoning hint ──────────────────────────────────────────────────
+
+def _ask_explore_hint(frame, goal: str, llm_perceive) -> dict:
+    """
+    Ask the VLM a richer spatial question every HINT_INTERVAL steps.
+
+    Returns a hint dict:
+        {"room": str, "stairs_visible": bool, "suggest": str}
+    suggest: "go_upstairs" | "keep_exploring" | "turn_around" | "none"
+
+    This lets the robot reason: "I'm in the living room, bed is probably
+    upstairs — if I see stairs I should go up."
+    """
+    import json
+    try:
+        import io, base64
+        import numpy as np
+        from PIL import Image
+        from agent.llm_agent import _get_client, _extract_text, _MODEL_PERCEIVE
+
+        client = _get_client()
+        if client is None:
+            return {}
+
+        img = Image.fromarray(frame.astype(np.uint8))
+        buf = io.BytesIO()
+        img.save(buf, format='JPEG', quality=80)
+        b64 = base64.b64encode(buf.getvalue()).decode()
+
+        prompt = (
+            f"你是家居导航机器人。导航目标：{goal}\n"
+            "观察当前第一视角画面，回答以下问题，只返回一行JSON：\n"
+            '{"room":"客厅|卧室|厨房|走廊|楼梯间|浴室|其他",'
+            '"stairs_visible":bool,'
+            '"suggest":"go_upstairs|keep_exploring|turn_around|none",'
+            '"reason":"一句话说明建议理由"}\n'
+            "suggest规则:\n"
+            "- 若目标通常在其他楼层（如床在卧室/二楼）且当前看到楼梯 → go_upstairs\n"
+            "- 若当前房间不可能有目标且无楼梯 → turn_around\n"
+            "- 其他情况 → keep_exploring"
+        )
+
+        resp = client.messages.create(
+            model=_MODEL_PERCEIVE,
+            max_tokens=128,
+            messages=[{"role": "user", "content": [
+                {"type": "image", "source": {
+                    "type": "base64", "media_type": "image/jpeg", "data": b64}},
+                {"type": "text", "text": prompt},
+            ]}],
+        )
+        text = _extract_text(resp.content).strip()
+        if not text or "{" not in text:
+            return {}
+        return json.loads(text[text.find("{"):text.rfind("}")+1])
+    except Exception:
+        return {}
+
+
 # ── main task loop ──────────────────────────────────────────────────────────
 
 def run_task(
@@ -172,6 +232,8 @@ def run_task(
         "explore_map":   explore_map,
         "frontier_pos":  None,
         "vlm_step":      -VLM_CALL_INTERVAL,  # trigger VLM immediately
+        "hint_step":     -HINT_INTERVAL,       # trigger spatial hint immediately
+        "last_hint":     {},
     }
 
     if on_frame:
@@ -212,6 +274,25 @@ def run_task(
                         nav_state["waypoints"]       = []
             except Exception:
                 pass
+
+        # ── spatial reasoning hint (less frequent) ───────────────────
+        if (
+            llm_perceive is not None
+            and nav_state.get("target_pos") is None
+            and (step - nav_state["hint_step"]) >= HINT_INTERVAL
+        ):
+            hint = _ask_explore_hint(nav_state["last_frame"], task, llm_perceive)
+            if hint:
+                nav_state["last_hint"] = hint
+                nav_state["hint_step"] = step
+                suggest = hint.get("suggest", "none")
+                room    = hint.get("room", "?")
+                reason  = hint.get("reason", "")
+                stairs  = hint.get("stairs_visible", False)
+                # Log the spatial reasoning
+                import sys
+                print(f"  [HINT step={step}] room={room} stairs={stairs} "
+                      f"suggest={suggest} | {reason}", file=sys.stderr)
 
         # ── update value map ───────────────────────────────────────────
         vlm_score = float(nav_state["last_percept"].get("confidence", 0.0))
