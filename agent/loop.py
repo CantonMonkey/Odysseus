@@ -81,6 +81,12 @@ def _explore_frontier(env, nav_state: dict, explore_map: ExploreMap,
     robot_pos, _ = env.get_robot_pose()
     task          = nav_state.get("goal", "")
 
+    # Countdown anchor (post-ESCAPE exploration focus area)
+    if nav_state.get("anchor_steps_left", 0) > 0:
+        nav_state["anchor_steps_left"] -= 1
+        if nav_state["anchor_steps_left"] == 0:
+            nav_state["explore_anchor"] = None
+
     # Arrive at current frontier → clear and blacklist (don't revisit)
     f_pos = nav_state.get("frontier_pos")
     if f_pos is not None and _euclidean(robot_pos, np.array(f_pos)) < ARRIVE_DIST:
@@ -130,8 +136,14 @@ def _explore_frontier(env, nav_state: dict, explore_map: ExploreMap,
                         continue
                 v    = float(explore_map.value[i, j])
                 dist = np.sqrt((i - ri)**2 + (j - rj)**2) * explore_map.res
-                prox = max(0.0, (6.0 - dist) / 6.0) * 0.05
-                s    = v + prox
+                anchor = nav_state.get("explore_anchor")
+                if anchor is not None and nav_state.get("anchor_steps_left", 0) > 0:
+                    wx2, wz2 = explore_map._g2w(i, j)
+                    da = np.sqrt((wx2 - anchor[0])**2 + (wz2 - anchor[2])**2)
+                    s  = v + max(0.0, (8.0 - da) / 8.0) * 0.30
+                else:
+                    prox = max(0.0, (6.0 - dist) / 6.0) * 0.05
+                    s    = v + prox
                 if s > best_score:
                     best_score, best_ij = s, (i, j)
             if best_ij is not None:
@@ -334,6 +346,8 @@ def run_task(
                         nav_state["failed_frontiers"] = set()
                         nav_state["stagnant_steps"] = 0
                         nav_state["last_expl"] = explore_map.explored_fraction()
+                        nav_state["explore_anchor"] = rp_list
+                        nav_state["anchor_steps_left"] = 80
                         print(f"  [ESCAPE step={step}] {_tag} dist={best_dist:.1f}m", flush=True)
                     else:
                         # Truly stuck in isolated navmesh island — just rotate
