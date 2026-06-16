@@ -230,10 +230,22 @@ def verify_arrival(env, nav_state: dict) -> dict:
     # Use 1.5m to match SUCCESS_DIST in eval.py.  Semantic.txt bounding-box
     # centroids sit ~0.5m inside tall objects (fridge, TV), so 1.5m centroid
     # distance corresponds to ~1.0m from the actual object surface.
-    vlm_confirmed = target_visible and confidence >= 0.25 and dist <= 1.5
+    # Also cross-check XZ dist to nearest semantic instance to prevent VLM false positives
+    # (e.g. VLM sees "bedroom" and claims wardrobe visible when none is within 5m).
+    instances = nav_state.get("target_instances", [])
+    if instances and target_visible and confidence >= 0.25 and dist <= 1.5:
+        rx, rz = float(robot_pos[0]), float(robot_pos[2])
+        xz_inst = min(np.sqrt((float(p[0])-rx)**2 + (float(p[2])-rz)**2) for p in instances)
+        vlm_confirmed = xz_inst <= 1.5
+        if not vlm_confirmed:
+            print(f"  [VERIFY step={step}] VLM vis=True but nearest instance xz={xz_inst:.2f}m > 1.5m → NOT confirmed", flush=True)
+    else:
+        vlm_confirmed = target_visible and confidence >= 0.25 and dist <= 1.5
 
     if vlm_confirmed:
-        print(f"  [VERIFY step={step}] SUCCESS dist_to_tgt={dist:.3f}m vis={target_visible} conf={confidence:.2f} → DONE", flush=True)
+        rx, rz = float(robot_pos[0]), float(robot_pos[2])
+        xz_inst = min(np.sqrt((float(p[0])-rx)**2 + (float(p[2])-rz)**2) for p in instances) if instances else dist
+        print(f"  [VERIFY step={step}] SUCCESS dist_to_tgt={dist:.3f}m xz_inst={xz_inst:.3f}m vis={target_visible} conf={confidence:.2f} → DONE", flush=True)
         nav_state["done"]          = True
         nav_state["current_skill"] = "done"
     elif dist <= ARRIVE_DIST and target_visible and confidence >= 0.25:

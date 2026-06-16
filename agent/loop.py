@@ -404,16 +404,20 @@ def run_task(
                                      f"depth_est=({tgt[0]:.2f},{tgt[2]:.2f})")
                                 tgt = snapped
                             else:
-                                _log(f"  [SNAP step={step}] all pool instances blacklisted ({len(blacklisted)}) → using raw depth estimate")
+                                # All semantic instances blacklisted — don't use raw depth estimate
+                                # because it may point to unrelated furniture. Keep exploring.
+                                _log(f"  [SNAP step={step}] all pool instances blacklisted ({len(blacklisted)}) → skip (continue explore)")
+                                tgt = None
                         else:
                             _log(f"  [SNAP step={step}] no instance list → using raw depth estimate ({tgt[0]:.2f},{tgt[2]:.2f})")
 
-                        old_skill = nav_state.get("current_skill")
-                        nav_state["target_pos"]    = tgt.tolist()
-                        nav_state["current_skill"] = "follow_path"
-                        nav_state["waypoints"]     = []
-                        if old_skill != "follow_path":
-                            _log(f"  [VLM decision] {old_skill} → follow_path (target detected conf={confidence:.2f})")
+                        if tgt is not None:
+                            old_skill = nav_state.get("current_skill")
+                            nav_state["target_pos"]    = tgt.tolist()
+                            nav_state["current_skill"] = "follow_path"
+                            nav_state["waypoints"]     = []
+                            if old_skill != "follow_path":
+                                _log(f"  [VLM decision] {old_skill} → follow_path (target detected conf={confidence:.2f})")
                 elif not vis:
                     _log(f"  [VLM decision] not visible → value_map update only (rel={rel:.2f})")
                 elif _in_verify:
