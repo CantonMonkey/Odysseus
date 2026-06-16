@@ -260,7 +260,7 @@ def run_task(
                 try:
                     _robot_pos0, _ = env.get_robot_pose()
                     _R0 = env.get_rotation_matrix()
-                    percept = llm_perceive(frame, goal)
+                    percept = llm_perceive(frame, task)
                     nav_state["last_percept"] = percept
                     nav_state["vlm_step"] = nav_state["step_count"]
                     vis0 = percept.get("target_visible", False)
