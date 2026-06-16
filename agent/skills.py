@@ -85,13 +85,16 @@ def follow_path(env, nav_state: dict) -> dict:
     """Follow the Habitat pathfinder shortest path toward the goal.
 
     Re-plans automatically whenever the waypoint list is exhausted.
-    Falls back to search_room if no path can be found.
+    Clears target_pos and reverts to explore if no path can be found,
+    or if distance hasn't improved in FOLLOW_STAGNANT_LIMIT steps.
     """
     from agent.habitat_env import ACTION_FORWARD
 
+    FOLLOW_STAGNANT_LIMIT = 25  # steps without dist improvement → give up
+
     target_pos = nav_state.get("target_pos")
     if target_pos is None:
-        nav_state["current_skill"] = "search_room"
+        nav_state["current_skill"] = "explore_frontier"
         return nav_state
 
     robot_pos, _ = env.get_robot_pose()
@@ -101,6 +104,27 @@ def follow_path(env, nav_state: dict) -> dict:
     if dist <= ARRIVE_DIST:
         print(f"  [FOLLOW step={step}] dist={dist:.3f}m ≤ {ARRIVE_DIST}m → verify_arrival", flush=True)
         nav_state["current_skill"] = "verify_arrival"
+        nav_state["follow_stagnant"] = 0
+        return nav_state
+
+    # Stagnation: if dist hasn't decreased in FOLLOW_STAGNANT_LIMIT steps, abandon target
+    last_dist = nav_state.get("follow_last_dist", dist + 1.0)
+    if dist >= last_dist - 0.05:
+        nav_state["follow_stagnant"] = nav_state.get("follow_stagnant", 0) + 1
+    else:
+        nav_state["follow_stagnant"] = 0
+    nav_state["follow_last_dist"] = dist
+
+    if nav_state.get("follow_stagnant", 0) >= FOLLOW_STAGNANT_LIMIT:
+        tgt = nav_state.get("target_pos")
+        if tgt:
+            key = (round(tgt[0], 1), round(tgt[2], 1))
+            nav_state.setdefault("blacklisted_snap", set()).add(key)
+            print(f"  [FOLLOW step={step}] stagnant {FOLLOW_STAGNANT_LIMIT} steps dist={dist:.2f}m → blacklist ({key[0]},{key[1]}) + explore", flush=True)
+        nav_state["target_pos"] = None
+        nav_state["current_skill"] = "explore_frontier"
+        nav_state["follow_stagnant"] = 0
+        nav_state["waypoints"] = []
         return nav_state
 
     waypoints = nav_state.get("waypoints", [])
@@ -114,8 +138,16 @@ def follow_path(env, nav_state: dict) -> dict:
             nav_state["waypoints"] = waypoints
 
     if not waypoints:
-        print(f"  [FOLLOW step={step}] no path to target → search_room", flush=True)
-        nav_state["current_skill"] = "search_room"
+        # Pathfinder can't reach target — blacklist this SNAP position and explore
+        tgt = nav_state.get("target_pos")
+        if tgt:
+            key = (round(tgt[0], 1), round(tgt[2], 1))
+            nav_state.setdefault("blacklisted_snap", set()).add(key)
+            print(f"  [FOLLOW step={step}] no path → blacklist ({key[0]},{key[1]}) + explore_frontier", flush=True)
+        nav_state["target_pos"] = None
+        nav_state["current_skill"] = "explore_frontier"
+        nav_state["follow_stagnant"] = 0
+        nav_state["waypoints"] = []
         return nav_state
 
     next_wp = np.array(waypoints[0])

@@ -246,6 +246,7 @@ def run_task(
         "vlm_step":         -VLM_CALL_INTERVAL,
         "last_scene":       {},
         "target_instances": instances,
+        "blacklisted_snap": set(),   # XZ keys of SNAP targets pathfinder can't reach
         # Decision chain stats (accumulated per episode)
         "_stats": {
             "vlm_calls": 0, "vlm_visible": 0, "snap_events": 0,
@@ -326,11 +327,14 @@ def run_task(
                         depth, direction, robot_pos, R)
                     if tgt is not None:
                         inst_list = nav_state.get("target_instances", [])
+                        blacklisted = nav_state.get("blacklisted_snap", set())
                         if inst_list:
                             robot_y    = float(robot_pos[1])
                             same_floor = [p for p in inst_list if abs(float(p[1]) - robot_y) < 1.0]
                             nearby     = [p for p in same_floor if float(np.linalg.norm(p - robot_pos)) < 10.0]
                             pool       = nearby if nearby else same_floor if same_floor else inst_list
+                            # Skip instances whose XZ positions have been blacklisted (unreachable by pathfinder)
+                            pool = [p for p in pool if (round(float(p[0]),1), round(float(p[2]),1)) not in blacklisted]
 
                             if pool:
                                 nearest  = min(pool, key=lambda p: float(np.linalg.norm(p - robot_pos)))
@@ -338,13 +342,13 @@ def run_task(
                                 snap_dist = float(np.linalg.norm(snapped - robot_pos))
                                 stats["snap_events"] += 1
                                 _log(f"  [SNAP step={step}] "
-                                     f"pool={len(pool)} (same_floor={len(same_floor)}/{len(inst_list)} nearby={len(nearby)}) "
+                                     f"pool={len(pool)} (same_floor={len(same_floor)}/{len(inst_list)} nearby={len(nearby)} blacklisted={len(blacklisted)}) "
                                      f"→ chosen=({nearest[0]:.2f},{nearest[2]:.2f}) "
                                      f"robot_dist={snap_dist:.1f}m "
                                      f"depth_est=({tgt[0]:.2f},{tgt[2]:.2f})")
                                 tgt = snapped
                             else:
-                                _log(f"  [SNAP step={step}] no instances in pool → using raw depth estimate")
+                                _log(f"  [SNAP step={step}] all pool instances blacklisted ({len(blacklisted)}) → using raw depth estimate")
                         else:
                             _log(f"  [SNAP step={step}] no instance list → using raw depth estimate ({tgt[0]:.2f},{tgt[2]:.2f})")
 
