@@ -431,11 +431,14 @@ def run_task(
         # ── Stagnation / ESCAPE ────────────────────────────────────────
         if current_skill == "explore_frontier":
             cur_expl = explore_map.explored_fraction()
-            if abs(cur_expl - nav_state.get("last_expl", 0.0)) < 0.001:
-                nav_state["stagnant_steps"] = nav_state.get("stagnant_steps", 0) + 1
-            else:
-                nav_state["stagnant_steps"] = 0
-                nav_state["last_expl"] = cur_expl
+            # Pause stagnation counter while navigating toward an ESCAPE anchor;
+            # otherwise the 80-step anchor window gets cut short after only 40 steps.
+            if nav_state.get("anchor_steps_left", 0) <= 0:
+                if abs(cur_expl - nav_state.get("last_expl", 0.0)) < 0.001:
+                    nav_state["stagnant_steps"] = nav_state.get("stagnant_steps", 0) + 1
+                else:
+                    nav_state["stagnant_steps"] = 0
+            nav_state["last_expl"] = cur_expl
             if nav_state["stagnant_steps"] >= 40:
                 pf = env._sim.pathfinder
                 from agent.skills import _replan
