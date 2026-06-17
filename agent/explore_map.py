@@ -163,5 +163,27 @@ class ExploreMap:
         wx, wz = self._g2w(*best_ij)
         return np.array([wx, robot_pos[1], wz], dtype=np.float32)
 
+
+    def top_k_frontiers(self, k: int, robot_pos: np.ndarray):
+        """Return up to k best frontiers as [(score, world_xyz), ...]."""
+        cells = self.frontiers()
+        if not cells:
+            return []
+        ri, rj = self._w2g(robot_pos[0], robot_pos[2])
+        scored = []
+        for i, j in cells:
+            dist = float(np.sqrt((i - ri)**2 + (j - rj)**2)) * self.res
+            if dist < 0.8:
+                continue
+            v = float(self.value[i, j])
+            prox = max(0.0, (6.0 - dist) / 6.0) * 0.05
+            scored.append((v + prox, i, j))
+        scored.sort(reverse=True)
+        result = []
+        for score, i, j in scored[:k]:
+            wx, wz = self._g2w(i, j)
+            result.append((score, np.array([wx, robot_pos[1], wz], dtype=np.float32)))
+        return result
+
     def explored_fraction(self) -> float:
         return float(np.mean(self.grid == EXPLORED))

@@ -140,7 +140,7 @@ def _run_episode(
     if use_vlm:
         try:
             from agent.llm_agent import perceive
-            llm_perceive = lambda frame, g: perceive(frame, g)
+            llm_perceive = lambda frame, g, **kw: perceive(frame, g, **kw)
         except ImportError:
             print("    [warn] llm_agent not importable — running without VLM")
             llm_perceive = None

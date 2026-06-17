@@ -105,7 +105,9 @@ def _internvl_pixel_values(pil_image, max_num=6):
     return torch.stack(tiles).to(torch.bfloat16).cuda()
 
 
-def _perceive_local(frame: np.ndarray, goal: str) -> dict:
+def _perceive_local(frame: np.ndarray, goal: str,
+                    annotated_frame: np.ndarray = None,
+                    n_waypoints: int = 0) -> dict:
     """InternVL3 local inference for visual perception."""
     import json
     from PIL import Image
@@ -114,8 +116,19 @@ def _perceive_local(frame: np.ndarray, goal: str) -> dict:
     if model is None:
         return _perceive_rule(frame, goal)
 
-    pil = Image.fromarray(frame.astype(np.uint8))
+    use_frame = annotated_frame if annotated_frame is not None else frame
+    pil = Image.fromarray(use_frame.astype(np.uint8))
     pixel_values = _internvl_pixel_values(pil, max_num=4)
+
+    if n_waypoints >= 2:
+        waypoint_rule = (
+            f"- waypoint: 0-{n_waypoints}, choose the numbered circle most likely "
+            f"to lead toward {goal}; 0 means none suitable\n"
+        )
+        waypoint_field = f',"waypoint":int'
+    else:
+        waypoint_rule = ""
+        waypoint_field = ""
 
     prompt = (
         "<image>\n"
@@ -123,14 +136,15 @@ def _perceive_local(frame: np.ndarray, goal: str) -> dict:
         "Observe the entire image carefully. Return ONE JSON line, no other text:\n"
         '{"target_visible":bool,"direction":"left|center|right|not_visible",'
         '"confidence":float,"room":"living_room|bedroom|hallway|kitchen|staircase|bathroom|other",'
-        '"relevance":float}\n'
+        f'"relevance":float{waypoint_field}}}\n'
         "Rules:\n"
         f"- target_visible=true: {goal} is visible ANYWHERE (background/doorway/corner counts)\n"
         "- confidence: if visible 0.1-1.0 (partial/far=0.3-0.6, clear=0.8+), else 0.0\n"
         "- room: room type you are currently in\n"
         f"- relevance: 0.0-1.0, how likely navigating this direction leads to {goal}\n"
         "  (living_room for sofa/chair=0.9, hallway=0.4, bedroom for sofa=0.1)\n"
-        "- direction: where the target is (left/center/right), not_visible if absent"
+        "- direction: where the target is (left/center/right), not_visible if absent\n"
+        + waypoint_rule
     )
 
     try:
@@ -183,7 +197,9 @@ def _frame_to_b64(frame: np.ndarray) -> str:
 
 # ── PERCEIVE (public) ─────────────────────────────────────────────────────────
 
-def perceive(frame: np.ndarray, goal: str) -> dict:
+def perceive(frame: np.ndarray, goal: str,
+             annotated_frame: np.ndarray = None,
+             n_waypoints: int = 0) -> dict:
     """Analyse the current RGB frame with a VLM.
 
     Uses InternVL3 locally if VLN_LOCAL_MODEL is set; otherwise Anthropic API;
@@ -192,7 +208,7 @@ def perceive(frame: np.ndarray, goal: str) -> dict:
     confidence forced to 0.0 when target_visible=False.
     """
     if _LOCAL_MODEL_PATH:
-        return _perceive_local(frame, goal)
+        return _perceive_local(frame, goal, annotated_frame=annotated_frame, n_waypoints=n_waypoints)
 
     client = _get_client()
     if client is None:

@@ -355,7 +355,39 @@ def run_task(
         # ── VLFM-style VLM call ────────────────────────────────────────
         if llm_perceive is not None and (step - nav_state["vlm_step"]) >= VLM_CALL_INTERVAL:
             try:
-                percept = llm_perceive(nav_state["last_frame"], task)
+                # Phase 1: VLM-guided frontier selection
+                if (current_skill == "explore_frontier"
+                        and nav_state.get("target_pos") is None):
+                    from agent.vlm_frontier import project_waypoint, annotate_frame
+                    _candidates = explore_map.top_k_frontiers(5, robot_pos)
+                    _visible = []
+                    for _score, _fpos in _candidates:
+                        _uv = project_waypoint(_fpos, robot_pos, R)
+                        if _uv is not None:
+                            _visible.append((_fpos, _uv))
+                    if len(_visible) >= 2:
+                        _ann = annotate_frame(
+                            nav_state["last_frame"],
+                            [_uv for _, _uv in _visible],
+                            [str(_i+1) for _i in range(len(_visible))],
+                        )
+                        percept = llm_perceive(_ann, task,
+                                               annotated_frame=_ann,
+                                               n_waypoints=len(_visible))
+                        _choice = percept.get("waypoint", 0)
+                        if 1 <= _choice <= len(_visible):
+                            _chosen, _ = _visible[_choice - 1]
+                            nav_state["frontier_pos"] = (
+                                _chosen.tolist() if hasattr(_chosen, "tolist") else list(_chosen)
+                            )
+                            nav_state["waypoints"] = []
+                            _log(f"  [VLM-FRONTIER step={step}] chose waypoint {_choice} "
+                                 f"→ ({_chosen[0]:.1f},{_chosen[2]:.1f})")
+                        # choice=0 or none: fall through to existing value_map logic
+                    else:
+                        percept = llm_perceive(nav_state["last_frame"], task)
+                else:
+                    percept = llm_perceive(nav_state["last_frame"], task)
                 nav_state["last_percept"] = percept
                 nav_state["vlm_step"]     = step
                 stats["vlm_calls"] += 1
@@ -401,7 +433,25 @@ def run_task(
                             if pool:
                                 # Sort by XZ distance; check pathfinder reachability for
                                 # the top-8 nearest candidates (proactive, not reactive).
-                                pool_sorted = sorted(pool, key=lambda p: float(np.linalg.norm(p - robot_pos)))
+                                # Phase 3: QD-depth — use depth hint to prefer instance at right distance
+                                try:
+                                    _depth_map = env.get_depth()
+                                    _dir = percept.get("direction", "center")
+                                    _col = {"left": slice(0, 213), "right": slice(427, 640)}.get(_dir, slice(160, 480))
+                                    _roi = _depth_map[120:360, _col]
+                                    _valid_d = _roi[(_roi > 0.3) & (_roi < 8.0)]
+                                    _depth_hint = float(np.median(_valid_d)) if _valid_d.size > 10 else None
+                                except Exception:
+                                    _depth_hint = None
+                                if _depth_hint is not None:
+                                    _log(f"  [QD-DEPTH step={step}] dir={percept.get('direction','center')} hint={_depth_hint:.2f}m")
+                                    pool_sorted = sorted(pool,
+                                        key=lambda p: (
+                                            abs(float(np.sqrt((float(p[0])-float(robot_pos[0]))**2 + (float(p[2])-float(robot_pos[2]))**2)) - _depth_hint),
+                                            float(np.linalg.norm(p - robot_pos)),
+                                        ))
+                                else:
+                                    pool_sorted = sorted(pool, key=lambda p: float(np.linalg.norm(p - robot_pos)))
                                 nearest = None
                                 new_bl  = []
                                 for cand in pool_sorted[:8]:
@@ -504,7 +554,36 @@ def run_task(
                         unexp = 1 if (explore_map._valid(gi, gj) and explore_map.grid[gi, gj] == 0) else 0
                         return unexp * 100.0 + c[0]
                     escape_candidates.sort(key=lambda x: -_esc_score(x))
-                    best_dist, rp_list, wps = escape_candidates[0]
+                    # Phase 2: VLM-directed ESCAPE — show top-3 candidates, let VLM choose
+                    _esc_chosen = None
+                    try:
+                        from agent.vlm_frontier import project_waypoint, annotate_frame
+                        _top3 = escape_candidates[:3]
+                        _esc_vis = []
+                        for _ed, _rpl, _ewps in _top3:
+                            _euv = project_waypoint(np.array(_rpl), robot_pos, R)
+                            if _euv is not None:
+                                _esc_vis.append((_rpl, _ewps, _euv))
+                        if len(_esc_vis) >= 2:
+                            _eann = annotate_frame(
+                                nav_state["last_frame"],
+                                [_euv for _, _, _euv in _esc_vis],
+                                [str(_ei+1) for _ei in range(len(_esc_vis))],
+                            )
+                            _ep = llm_perceive(_eann, task,
+                                               annotated_frame=_eann,
+                                               n_waypoints=len(_esc_vis))
+                            _ec = _ep.get("waypoint", 0)
+                            if 1 <= _ec <= len(_esc_vis):
+                                _esc_chosen = _esc_vis[_ec - 1]
+                                _log(f"  [ESCAPE-VLM step={step}] VLM selected direction {_ec}")
+                    except Exception as _ee:
+                        _log(f"  [ESCAPE-VLM step={step}] VLM selection failed: {_ee}")
+                    if _esc_chosen is not None:
+                        rp_list, wps, _ = _esc_chosen
+                        best_dist = float(np.linalg.norm(np.array(rp_list) - robot_pos))
+                    else:
+                        best_dist, rp_list, wps = escape_candidates[0]
                     gi, gj = explore_map._w2g(rp_list[0], rp_list[2])
                     _tag = "UNEXP" if (explore_map._valid(gi, gj) and explore_map.grid[gi, gj] == 0) else "EXP"
                     nav_state["frontier_pos"] = rp_list
