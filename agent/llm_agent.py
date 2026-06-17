@@ -153,29 +153,11 @@ def _perceive_local(frame: np.ndarray, goal: str,
         skill_field = ""
         skill_rules = ""
 
-    # CoT: structured thinking block before JSON decision
-    if context:
-        _goal_room = {
-            "衣柜": "bedroom", "床": "bedroom", "床头柜": "bedroom",
-            "冰箱": "kitchen", "桌子": "dining room or kitchen",
-            "电视": "living room", "沙发": "living room",
-            "浴缸": "bathroom", "镜子": "bathroom or bedroom",
-        }.get(goal, "context-dependent room")
-        cot_block = (
-            "Before deciding, think step by step (one line each):\n"
-            "where_am_i: <describe current room and key objects visible>\n"
-            f"goal_location: {goal} is typically found in {_goal_room!r}\n"
-            "plan: <what to do this step — explore which direction, snap, escape, or verify>\n"
-            "===\n"
-        )
-    else:
-        cot_block = ""
-
     prompt = (
         "<image>\n"
         f"You are a home navigation robot brain. Navigation goal: {goal}\n"
-        + ctx_str + cot_block +
-        "After your reasoning above, output ONE JSON line, no other text:\n"
+        + ctx_str +
+        "Observe the entire image carefully. Return ONE JSON line, no other text:\n"
         '{"target_visible":bool,"direction":"left|center|right|not_visible",'
         '"confidence":float,"room":"living_room|bedroom|hallway|kitchen|staircase|bathroom|other",'
         f'"relevance":float{waypoint_field}{skill_field}}}\n'
@@ -191,7 +173,7 @@ def _perceive_local(frame: np.ndarray, goal: str,
 
     try:
         import torch
-        gen_cfg = dict(max_new_tokens=256, do_sample=False)
+        gen_cfg = dict(max_new_tokens=128, do_sample=False)
         text = model.chat(tokenizer, pixel_values, prompt, gen_cfg)
         torch.cuda.empty_cache()
         text = (text or "").strip()

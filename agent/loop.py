@@ -605,6 +605,7 @@ def run_task(
                         nav_state["last_expl"]         = explore_map.explored_fraction()
                         nav_state["explore_anchor"]    = _erl4
                         nav_state["anchor_steps_left"] = 80
+                        nav_state["blacklisted_snap"]  = set()
                         stats["escape_events"] += 1
                         _log(f"  [BRAIN-ESCAPE step={step}] dist={_ebd4:.1f}m "
                              f"tgt=({_erl4[0]:.1f},{_erl4[2]:.1f}) VLM-triggered")
@@ -717,6 +718,7 @@ def run_task(
                     nav_state["last_expl"] = explore_map.explored_fraction()
                     nav_state["explore_anchor"] = rp_list
                     nav_state["anchor_steps_left"] = 80
+                    nav_state["blacklisted_snap"]  = set()
                     stats["escape_events"] += 1
                     idist = _inst_dist(robot_pos, instances)
                     _log(f"  [ESCAPE step={step}] {_tag} dist={best_dist:.1f}m "
