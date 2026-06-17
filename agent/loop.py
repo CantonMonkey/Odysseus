@@ -476,7 +476,7 @@ def run_task(
                                     pool_sorted = sorted(pool, key=lambda p: float(np.linalg.norm(p - robot_pos)))
                                 nearest = None
                                 new_bl  = []
-                                for cand in pool_sorted[:8]:
+                                for cand in pool_sorted[:3]:
                                     cand_arr = np.array([float(cand[0]), float(tgt[1]), float(cand[2])], dtype=np.float32)
                                     if _pathfinder_reachable(env, robot_pos, cand_arr):
                                         nearest = cand
@@ -502,8 +502,9 @@ def run_task(
                             else:
                                 # All semantic instances blacklisted — don't use raw depth estimate
                                 # because it may point to unrelated furniture. Keep exploring.
-                                _log(f"  [SNAP step={step}] all pool instances blacklisted ({len(blacklisted)}) → skip (continue explore)")
+                                _log(f"  [SNAP step={step}] all pool instances blacklisted ({len(blacklisted)}) → force ESCAPE")
                                 tgt = None
+                                nav_state["stagnant_steps"] = nav_state.get("stagnant_steps", 0) + 20
                         else:
                             _log(f"  [SNAP step={step}] no instance list → using raw depth estimate ({tgt[0]:.2f},{tgt[2]:.2f})")
 
@@ -549,7 +550,7 @@ def run_task(
                             if _pl4:
                                 _ps4 = sorted(_pl4, key=lambda p: float(np.linalg.norm(p - robot_pos)))
                                 _n4 = None
-                                for _c4 in _ps4[:8]:
+                                for _c4 in _ps4[:3]:
                                     _ca4 = np.array([float(_c4[0]), float(_tgt4[1]),
                                                      float(_c4[2])], dtype=np.float32)
                                     if _pathfinder_reachable(env, robot_pos, _ca4):
