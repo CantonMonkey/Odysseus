@@ -195,6 +195,8 @@ def _perceive_local(frame: np.ndarray, goal: str,
         text = model.chat(tokenizer, pixel_values, prompt, gen_cfg)
         torch.cuda.empty_cache()
         text = (text or "").strip()
+        if text:
+            print(f"[VLM-RAW] {text[:400]}", flush=True)
         if not text or "{" not in text:
             return _perceive_rule(frame, goal)
         _js = text.rfind("{"); _je = text.rfind("}") + 1
