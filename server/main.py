@@ -53,7 +53,8 @@ def _habitat_worker():
     env      = HabitatEnv(gpu_id=0)
     dialogue = DialogueAgent()
 
-    env.reset(SCENE_DIR)
+    FIXED_SPAWN = [-8.24, 0.163, -1.47]  # living room, good demo start
+    env.reset(SCENE_DIR, start_pos=FIXED_SPAWN)
     _frame_q.put(("frame", env.get_frame(), {"status": "idle"}))  # initial frame
 
     while True:
@@ -65,7 +66,7 @@ def _habitat_worker():
         goal = cmd  # str
 
         try:
-            env.reset(SCENE_DIR)
+            env.reset(SCENE_DIR, start_pos=FIXED_SPAWN)
 
             def on_frame(frame, nav_state):
                 state = {
