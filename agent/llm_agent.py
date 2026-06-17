@@ -107,7 +107,8 @@ def _internvl_pixel_values(pil_image, max_num=6):
 
 def _perceive_local(frame: np.ndarray, goal: str,
                     annotated_frame: np.ndarray = None,
-                    n_waypoints: int = 0) -> dict:
+                    n_waypoints: int = 0,
+                    context: dict = None) -> dict:
     """InternVL3 local inference for visual perception."""
     import json
     from PIL import Image
@@ -130,13 +131,36 @@ def _perceive_local(frame: np.ndarray, goal: str,
         waypoint_rule = ""
         waypoint_field = ""
 
+    # Phase 4: build context block + skill decision field
+    if context:
+        ctx_str = (
+            f"Navigation state: step {context.get('step',0)}/{context.get('max_steps',500)}"
+            f" | explored {context.get('explored_pct',0):.0%}"
+            f" | stagnant {context.get('stagnant_steps',0)} steps\n"
+            f"Rooms seen: {context.get('rooms_str','none yet')}\n"
+            f"Nearest {goal}: {context.get('nearest_dist_str','unknown')}\n"
+        )
+        skill_field = ',"skill":"explore|snap|escape|verify","reason":"str"'
+        skill_rules = (
+            "Skill (choose one action for THIS step):\n"
+            f"- \"snap\": {goal} is clearly visible, navigate to it NOW\n"
+            "- \"explore\": keep searching, pick numbered waypoint (0=auto)\n"
+            "- \"escape\": I am stuck/looping, need a completely different area\n"
+            f"- \"verify\": I am very close to {goal}, confirm arrival\n"
+        )
+    else:
+        ctx_str = ""
+        skill_field = ""
+        skill_rules = ""
+
     prompt = (
         "<image>\n"
-        f"You are a home navigation robot. Navigation goal: {goal}\n"
+        f"You are a home navigation robot brain. Navigation goal: {goal}\n"
+        + ctx_str +
         "Observe the entire image carefully. Return ONE JSON line, no other text:\n"
         '{"target_visible":bool,"direction":"left|center|right|not_visible",'
         '"confidence":float,"room":"living_room|bedroom|hallway|kitchen|staircase|bathroom|other",'
-        f'"relevance":float{waypoint_field}}}\n'
+        f'"relevance":float{waypoint_field}{skill_field}}}\n'
         "Rules:\n"
         f"- target_visible=true: {goal} is visible ANYWHERE (background/doorway/corner counts)\n"
         "- confidence: if visible 0.1-1.0 (partial/far=0.3-0.6, clear=0.8+), else 0.0\n"
@@ -144,7 +168,7 @@ def _perceive_local(frame: np.ndarray, goal: str,
         f"- relevance: 0.0-1.0, how likely navigating this direction leads to {goal}\n"
         "  (living_room for sofa/chair=0.9, hallway=0.4, bedroom for sofa=0.1)\n"
         "- direction: where the target is (left/center/right), not_visible if absent\n"
-        + waypoint_rule
+        + waypoint_rule + skill_rules
     )
 
     try:
@@ -199,7 +223,8 @@ def _frame_to_b64(frame: np.ndarray) -> str:
 
 def perceive(frame: np.ndarray, goal: str,
              annotated_frame: np.ndarray = None,
-             n_waypoints: int = 0) -> dict:
+             n_waypoints: int = 0,
+             context: dict = None) -> dict:
     """Analyse the current RGB frame with a VLM.
 
     Uses InternVL3 locally if VLN_LOCAL_MODEL is set; otherwise Anthropic API;
@@ -208,7 +233,7 @@ def perceive(frame: np.ndarray, goal: str,
     confidence forced to 0.0 when target_visible=False.
     """
     if _LOCAL_MODEL_PATH:
-        return _perceive_local(frame, goal, annotated_frame=annotated_frame, n_waypoints=n_waypoints)
+        return _perceive_local(frame, goal, annotated_frame=annotated_frame, n_waypoints=n_waypoints, context=context)
 
     client = _get_client()
     if client is None:

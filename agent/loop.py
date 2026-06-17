@@ -292,6 +292,7 @@ def run_task(
         "last_scene":       {},
         "target_instances": instances,
         "blacklisted_snap": set(),   # XZ keys of SNAP targets pathfinder can't reach
+        "room_counts":    {},            # Phase 4: room visit counts for VLM context
         # Decision chain stats (accumulated per episode)
         "_stats": {
             "vlm_calls": 0, "vlm_visible": 0, "snap_events": 0,
@@ -355,7 +356,23 @@ def run_task(
         # ── VLFM-style VLM call ────────────────────────────────────────
         if llm_perceive is not None and (step - nav_state["vlm_step"]) >= VLM_CALL_INTERVAL:
             try:
-                # Phase 1: VLM-guided frontier selection
+                # Phase 4: build context dict for VLM brain
+                _idist_ctx = _inst_dist(robot_pos, instances)
+                _room_counts = nav_state.get("room_counts", {})
+                _rooms_str = ", ".join(
+                    f"{r}:{c}" for r, c in
+                    sorted(_room_counts.items(), key=lambda x: -x[1])[:5]
+                ) or "none yet"
+                _ctx = {
+                    "step":             step,
+                    "max_steps":        max_steps,
+                    "explored_pct":     explore_map.explored_fraction(),
+                    "stagnant_steps":   nav_state.get("stagnant_steps", 0),
+                    "rooms_str":        _rooms_str,
+                    "nearest_dist_str": f"{_idist_ctx:.1f}m" if _idist_ctx else "unknown",
+                }
+
+                # Phase 1: VLM-guided frontier selection (only when choosing a new frontier)
                 if (current_skill == "explore_frontier"
                         and nav_state.get("target_pos") is None
                         and nav_state.get("frontier_pos") is None):
@@ -374,7 +391,8 @@ def run_task(
                         )
                         percept = llm_perceive(_ann, task,
                                                annotated_frame=_ann,
-                                               n_waypoints=len(_visible))
+                                               n_waypoints=len(_visible),
+                                               context=_ctx)
                         _choice = percept.get("waypoint", 0)
                         if 1 <= _choice <= len(_visible):
                             _chosen, _ = _visible[_choice - 1]
@@ -383,14 +401,17 @@ def run_task(
                             )
                             nav_state["waypoints"] = []
                             _log(f"  [VLM-FRONTIER step={step}] chose waypoint {_choice} "
-                                 f"→ ({_chosen[0]:.1f},{_chosen[2]:.1f})")
-                        # choice=0 or none: fall through to existing value_map logic
+                                 f"\u2192 ({_chosen[0]:.1f},{_chosen[2]:.1f})")
                     else:
-                        percept = llm_perceive(nav_state["last_frame"], task)
+                        percept = llm_perceive(nav_state["last_frame"], task, context=_ctx)
                 else:
-                    percept = llm_perceive(nav_state["last_frame"], task)
+                    percept = llm_perceive(nav_state["last_frame"], task, context=_ctx)
+
                 nav_state["last_percept"] = percept
                 nav_state["vlm_step"]     = step
+                # Track room visits for Phase 4 context
+                _rm = percept.get("room", "other")
+                nav_state["room_counts"][_rm] = nav_state["room_counts"].get(_rm, 0) + 1
                 stats["vlm_calls"] += 1
 
                 confidence = float(percept.get("confidence", 0.0))
@@ -499,6 +520,108 @@ def run_task(
                     pass  # already logged above
                 else:
                     _log(f"  [VLM decision] vis=True but conf={confidence:.2f} < threshold={VLM_CONF_THRESHOLD} → ignored")
+
+                # ── Phase 4: VLM skill decisions ──────────────────────────
+                _skill  = percept.get("skill", "")
+                _reason = percept.get("reason", "")
+                _conf4  = float(percept.get("confidence", 0.0))
+                _vis4   = percept.get("target_visible", False)
+                if _skill:
+                    _log(f"  [BRAIN step={step}] skill={_skill} reason={str(_reason)[:80]!r}")
+
+                # BRAIN-SNAP: VLM says target visible, navigate now
+                if (_skill == "snap" and _vis4 and _conf4 >= 0.15
+                        and not _in_verify
+                        and nav_state.get("target_pos") is None):
+                    _depth4 = env.get_depth()
+                    _dir4   = percept.get("direction", "center")
+                    _tgt4   = _estimate_target_pos(_depth4, _dir4, robot_pos, R)
+                    if _tgt4 is not None:
+                        _il4 = nav_state.get("target_instances", [])
+                        _bl4 = nav_state.get("blacklisted_snap", set())
+                        if _il4:
+                            _ry4 = float(robot_pos[1])
+                            _sf4 = [p for p in _il4 if abs(float(p[1]) - _ry4) < 1.0]
+                            _nb4 = [p for p in _sf4 if float(np.linalg.norm(p - robot_pos)) < 10.0]
+                            _pl4 = _nb4 if _nb4 else _sf4 if _sf4 else _il4
+                            _pl4 = [p for p in _pl4
+                                    if (round(float(p[0]),1), round(float(p[2]),1)) not in _bl4]
+                            if _pl4:
+                                _ps4 = sorted(_pl4, key=lambda p: float(np.linalg.norm(p - robot_pos)))
+                                _n4 = None
+                                for _c4 in _ps4[:8]:
+                                    _ca4 = np.array([float(_c4[0]), float(_tgt4[1]),
+                                                     float(_c4[2])], dtype=np.float32)
+                                    if _pathfinder_reachable(env, robot_pos, _ca4):
+                                        _n4 = _c4; break
+                                if _n4 is None: _n4 = _ps4[0]
+                                _sn4 = np.array([float(_n4[0]), float(_tgt4[1]),
+                                                 float(_n4[2])], dtype=np.float32)
+                                nav_state["target_pos"]    = _sn4.tolist()
+                                nav_state["current_skill"] = "follow_path"
+                                nav_state["waypoints"]     = []
+                                stats["snap_events"] += 1
+                                _log(f"  [BRAIN-SNAP step={step}] conf={_conf4:.2f} "
+                                     f"\u2192 follow_path ({_n4[0]:.2f},{_n4[2]:.2f})")
+
+                # BRAIN-ESCAPE: VLM says stuck, escape now (bypass 40-step wait)
+                elif (_skill == "escape"
+                      and current_skill == "explore_frontier"
+                      and nav_state.get("anchor_steps_left", 0) <= 0):
+                    from agent.skills import _replan as _rpl4
+                    _pf4 = env._sim.pathfinder
+                    _ecs4 = []
+                    for _ in range(50):
+                        _rpt4 = _pf4.get_random_navigable_point()
+                        if not any(np.isnan(_rpt4)) and abs(_rpt4[1] - robot_pos[1]) < 1.0:
+                            _d4 = float(np.linalg.norm(np.array(_rpt4) - robot_pos))
+                            if _d4 > 3.0:
+                                _w4 = _rpl4(env, robot_pos, _rpt4)
+                                if _w4: _ecs4.append((_d4, _rpt4.tolist(), _w4))
+                    if _ecs4:
+                        _ecs4.sort(key=lambda x: -x[0])
+                        _ebd4, _erl4, _ew4 = _ecs4[0]
+                        try:
+                            from agent.vlm_frontier import project_waypoint, annotate_frame
+                            _etop4 = [(rpl, wps, project_waypoint(np.array(rpl), robot_pos, R))
+                                      for _, rpl, wps in _ecs4[:3]
+                                      if project_waypoint(np.array(rpl), robot_pos, R) is not None]
+                            if len(_etop4) >= 2:
+                                _eann4 = annotate_frame(nav_state["last_frame"],
+                                                        [u for _, _, u in _etop4],
+                                                        [str(i+1) for i in range(len(_etop4))])
+                                _ep4r = llm_perceive(_eann4, task, annotated_frame=_eann4,
+                                                     n_waypoints=len(_etop4))
+                                _ec4n = _ep4r.get("waypoint", 0)
+                                if 1 <= _ec4n <= len(_etop4):
+                                    _erl4, _ew4, _ = _etop4[_ec4n - 1]
+                                    _ebd4 = float(np.linalg.norm(np.array(_erl4) - robot_pos))
+                                    _log(f"  [BRAIN-ESCAPE-VLM step={step}] dir {_ec4n}")
+                        except Exception: pass
+                        nav_state["frontier_pos"]      = _erl4
+                        nav_state["waypoints"]         = _ew4
+                        nav_state["failed_frontiers"]  = set()
+                        nav_state["stagnant_steps"]    = 0
+                        nav_state["last_expl"]         = explore_map.explored_fraction()
+                        nav_state["explore_anchor"]    = _erl4
+                        nav_state["anchor_steps_left"] = 80
+                        stats["escape_events"] += 1
+                        _log(f"  [BRAIN-ESCAPE step={step}] dist={_ebd4:.1f}m "
+                             f"tgt=({_erl4[0]:.1f},{_erl4[2]:.1f}) VLM-triggered")
+
+                # BRAIN-VERIFY: VLM says very close, jump to verify_arrival
+                elif (_skill == "verify"
+                      and nav_state.get("target_pos") is None
+                      and current_skill != "verify_arrival"):
+                    _vd4 = _inst_dist(robot_pos, instances)
+                    if _vd4 is not None and _vd4 <= 3.0 and instances:
+                        _rx4 = float(robot_pos[0]); _rz4 = float(robot_pos[2])
+                        _vn4 = min(instances,
+                                   key=lambda p: (float(p[0])-_rx4)**2+(float(p[2])-_rz4)**2)
+                        nav_state["target_pos"]    = [float(_vn4[0]), float(robot_pos[1]),
+                                                      float(_vn4[2])]
+                        nav_state["current_skill"] = "verify_arrival"
+                        _log(f"  [BRAIN-VERIFY step={step}] dist={_vd4:.2f}m \u2192 verify_arrival")
 
             except Exception as e:
                 _log(f"  [VLM ERROR step={step}] {e}")
