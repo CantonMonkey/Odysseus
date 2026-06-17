@@ -357,7 +357,8 @@ def run_task(
             try:
                 # Phase 1: VLM-guided frontier selection
                 if (current_skill == "explore_frontier"
-                        and nav_state.get("target_pos") is None):
+                        and nav_state.get("target_pos") is None
+                        and nav_state.get("frontier_pos") is None):
                     from agent.vlm_frontier import project_waypoint, annotate_frame
                     _candidates = explore_map.top_k_frontiers(5, robot_pos)
                     _visible = []
