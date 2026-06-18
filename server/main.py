@@ -57,6 +57,9 @@ def _habitat_worker():
     env.reset(SCENE_DIR, start_pos=FIXED_SPAWN)
     _frame_q.put(("frame", env.get_frame(), {"status": "idle"}))  # initial frame
 
+    _explore_map = None  # preserved across tasks (grid + topo, value reset per task)
+    _topo_map    = None
+
     while True:
         cmd = _cmd_q.get()
         if cmd is None:  # shutdown signal
@@ -66,8 +69,6 @@ def _habitat_worker():
         goal = cmd  # str
 
         try:
-            env.reset(SCENE_DIR, start_pos=FIXED_SPAWN)
-
             def on_frame(frame, nav_state):
                 state = {
                     "status": "navigating",
@@ -77,7 +78,13 @@ def _habitat_worker():
                 }
                 _frame_q.put(("frame", frame, state))
 
-            result = run_task(env, goal, scene_dir=SCENE_DIR, on_frame=on_frame, llm_perceive=llm_perceive)
+            result = run_task(env, goal, scene_dir=SCENE_DIR, on_frame=on_frame,
+                              llm_perceive=llm_perceive,
+                              initial_explore_map=_explore_map,
+                              initial_topo_map=_topo_map)
+
+            _explore_map = result.get("explore_map")  # preserve spatial knowledge
+            _topo_map    = result.get("topo_map")
 
             if result.get("done"):
                 msg   = dialogue.arrival_message()

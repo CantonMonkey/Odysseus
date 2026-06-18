@@ -266,11 +266,17 @@ def run_task(
     llm_perceive=None,
     max_steps: int = MAX_STEPS,
     target_instances=None,
+    initial_explore_map=None,
+    initial_topo_map=None,
 ) -> dict:
     from agent.skills    import follow_path, verify_arrival
 
-    explore_map = ExploreMap()
-    topo_map    = TopoMap()
+    if initial_explore_map is not None:
+        initial_explore_map.value[:] = 0.0   # reset goal-specific heatmap
+        explore_map = initial_explore_map
+    else:
+        explore_map = ExploreMap()
+    topo_map = initial_topo_map if initial_topo_map is not None else TopoMap()
 
     instances = [np.asarray(p, dtype=np.float32) for p in target_instances] if target_instances else []
 

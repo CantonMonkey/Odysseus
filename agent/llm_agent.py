@@ -374,6 +374,25 @@ class DialogueAgent:
 
     def parse_goal(self, user_input: str) -> Optional[str]:
         """Extract a navigation goal keyword from a Chinese user utterance."""
+        # Primary: InternVL3 local zero-shot (~50ms, no network)
+        model, tokenizer = _get_local_model()
+        if model is not None:
+            import torch
+            prompt = (
+                "Extract the navigation target object from the user instruction. "
+                "Return ONLY the object name (one word or short phrase, Chinese or English). "
+                f"User: '{user_input}'"
+            )
+            try:
+                _r = model.chat(tokenizer, None, prompt,
+                                dict(max_new_tokens=16, do_sample=False))
+                torch.cuda.empty_cache()
+                _goal = (_r or "").strip().split('\n')[0].strip().rstrip('。，,.!')
+                if _goal:
+                    return _goal
+            except Exception:
+                pass
+        # Fallback 1: Anthropic API (mimo)
         client = _get_client()
         if client is not None:
             try:
