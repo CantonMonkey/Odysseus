@@ -120,6 +120,23 @@
     font-size: 12px;
     padding: 4px 10px;
   }
+  .msg.thought {
+    align-self: flex-start;
+    background: #1a1a2e;
+    border-left: 2px solid #5a4a8a;
+    color: #9a8abf;
+    font-size: 12px;
+    padding: 5px 10px;
+    border-radius: 4px 12px 12px 4px;
+    max-width: 95%;
+  }
+  .msg.thought .t-header {
+    font-size: 11px;
+    color: #6a5a9a;
+    margin-bottom: 2px;
+    font-family: monospace;
+  }
+  .msg.thought .t-reason { font-style: italic; }
 
   #input-area {
     padding: 12px;
@@ -194,6 +211,18 @@ let navigating = false;
 
 // ── WebSocket ─────────────────────────────────────────────────
 
+const SKILL_ICON = {snap:'⚡',explore:'🔍',escape:'🚪',verify:'✅'};
+
+function addThought(step, skill, reason) {
+  const div = document.createElement('div');
+  div.className = 'msg thought';
+  const icon = SKILL_ICON[skill] || '💭';
+  div.innerHTML = `<div class="t-header">${icon} ${skill} · step ${step}</div>`
+                + `<div class="t-reason">${reason}</div>`;
+  chatMessages.appendChild(div);
+  chatMessages.scrollTop = chatMessages.scrollHeight;
+}
+
 function connect() {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   ws = new WebSocket(`${proto}://${location.host}/ws`);
@@ -213,6 +242,8 @@ function connect() {
     if (data.type === 'frame') {
       drawFrame(data.img);
       updateNav(data);
+    } else if (data.type === 'thought') {
+      addThought(data.step, data.skill, data.reason);
     } else if (data.type === 'status') {
       handleStatus(data);
     }

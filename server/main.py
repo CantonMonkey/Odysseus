@@ -78,10 +78,17 @@ def _habitat_worker():
                 }
                 _frame_q.put(("frame", frame, state))
 
+            def on_thought(step, skill, reason):
+                _frame_q.put(("thought", None, {
+                    "status": "navigating", "goal": goal,
+                    "step": step, "skill": skill, "reason": reason,
+                }))
+
             result = run_task(env, goal, scene_dir=SCENE_DIR, on_frame=on_frame,
                               llm_perceive=llm_perceive,
                               initial_explore_map=_explore_map,
-                              initial_topo_map=_topo_map)
+                              initial_topo_map=_topo_map,
+                              on_thought=on_thought)
 
             _explore_map = result.get("explore_map")  # preserve spatial knowledge
             _topo_map    = result.get("topo_map")
@@ -119,6 +126,8 @@ async def _frame_broadcaster():
                 "img":  base64.b64encode(jpeg).decode(),
                 **state,
             }
+        elif kind == "thought":
+            payload = {"type": "thought", **state}
         else:
             payload = {"type": "status", **state}
 

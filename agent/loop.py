@@ -268,6 +268,7 @@ def run_task(
     target_instances=None,
     initial_explore_map=None,
     initial_topo_map=None,
+    on_thought=None,
 ) -> dict:
     from agent.skills    import follow_path, verify_arrival
 
@@ -535,6 +536,10 @@ def run_task(
                 _vis4   = percept.get("target_visible", False)
                 if _skill:
                     _log(f"  [BRAIN step={step}] skill={_skill} reason={str(_reason)[:80]!r}")
+                    _r_clean = str(_reason).strip()
+                    _skip = {'str','other','not_visible','bathroom','','clear','clearly visible'}
+                    if on_thought and _r_clean not in _skip and len(_r_clean) >= 12:
+                        on_thought(step, _skill, _r_clean)
 
                 # BRAIN-SNAP: VLM says target visible, navigate now
                 if (_skill == "snap" and _vis4 and _conf4 >= 0.15
