@@ -3,13 +3,16 @@ llm_agent.py
 
 LLM interface for visual perception + dialogue management.
 
-Two backends (local takes priority):
-  LOCAL (InternVL3-8B, on-device):
+Three backends (priority order):
+  vLLM (OpenAI-compatible server):
+    VLN_VLLM_BASE  – e.g. http://127.0.0.1:8088/v1
+    VLN_VLLM_MODEL – model name served by vLLM (default: InternVL3-8B)
+  LOCAL (InternVL3-8B, on-device, in-process):
     VLN_LOCAL_MODEL  – path to model weights dir
   API (Anthropic-compatible):
     ANTHROPIC_API_KEY, ANTHROPIC_BASE_URL, VLN_PERCEIVE_MODEL, VLN_DIALOGUE_MODEL
 
-Falls back to rule-based defaults if neither is configured.
+Falls back to rule-based defaults if none is configured.
 """
 
 import os
@@ -18,6 +21,11 @@ import numpy as np
 from typing import Optional
 
 _LOCAL_MODEL_PATH = os.environ.get("VLN_LOCAL_MODEL", "")
+_VLLM_BASE        = os.environ.get("VLN_VLLM_BASE", "")
+_VLLM_MODEL       = os.environ.get(
+    "VLN_VLLM_MODEL",
+    os.path.basename(_LOCAL_MODEL_PATH) if _LOCAL_MODEL_PATH else "InternVL3-8B",
+)
 _MODEL_PERCEIVE   = os.environ.get("VLN_PERCEIVE_MODEL",  "claude-sonnet-4-6")
 _MODEL_DIALOGUE   = os.environ.get("VLN_DIALOGUE_MODEL",  "claude-haiku-4-5-20251001")
 
@@ -99,28 +107,13 @@ def _internvl_pixel_values(pil_image, max_num=6):
         tile = resized.crop((c * IMAGE_SIZE, r * IMAGE_SIZE,
                               (c + 1) * IMAGE_SIZE, (r + 1) * IMAGE_SIZE))
         tiles.append(transform(tile))
-    # thumbnail always appended last
     if len(tiles) != 1:
         tiles.append(transform(pil_image.resize((IMAGE_SIZE, IMAGE_SIZE))))
     return torch.stack(tiles).to(torch.bfloat16).cuda()
 
 
-def _perceive_local(frame: np.ndarray, goal: str,
-                    annotated_frame: np.ndarray = None,
-                    n_waypoints: int = 0,
-                    context: dict = None) -> dict:
-    """InternVL3 local inference for visual perception."""
-    import json
-    from PIL import Image
-
-    model, tokenizer = _get_local_model()
-    if model is None:
-        return _perceive_rule(frame, goal)
-
-    use_frame = annotated_frame if annotated_frame is not None else frame
-    pil = Image.fromarray(use_frame.astype(np.uint8))
-    pixel_values = _internvl_pixel_values(pil, max_num=4)
-
+def _build_perceive_prompt(goal: str, n_waypoints: int = 0, context: dict = None) -> str:
+    """Build the text portion of the VLM perception prompt (no <image> prefix)."""
     if n_waypoints >= 2:
         waypoint_rule = (
             f"- waypoint: 0-{n_waypoints}, choose the numbered circle most likely "
@@ -131,7 +124,6 @@ def _perceive_local(frame: np.ndarray, goal: str,
         waypoint_rule = ""
         waypoint_field = ""
 
-    # Phase 4: build context block + skill decision field
     if context:
         ctx_str = (
             f"Navigation state: step {context.get('step',0)}/{context.get('max_steps',500)}"
@@ -153,8 +145,7 @@ def _perceive_local(frame: np.ndarray, goal: str,
         skill_field = ""
         skill_rules = ""
 
-    prompt = (
-        "<image>\n"
+    return (
         f"You are a home navigation robot brain. Navigation goal: {goal}\n"
         + ctx_str +
         "Observe the entire image carefully. Return ONE JSON line, no other text:\n"
@@ -171,22 +162,96 @@ def _perceive_local(frame: np.ndarray, goal: str,
         + waypoint_rule + skill_rules
     )
 
+
+# ── vLLM backend (OpenAI-compatible HTTP) ────────────────────────────────────
+
+def _frame_to_jpeg_b64(frame: np.ndarray) -> str:
+    """Encode RGB numpy array as JPEG base64 string."""
+    import cv2
+    _, buf = cv2.imencode(
+        '.jpg',
+        cv2.cvtColor(frame.astype(np.uint8), cv2.COLOR_RGB2BGR),
+        [cv2.IMWRITE_JPEG_QUALITY, 90],
+    )
+    return base64.b64encode(buf.tobytes()).decode()
+
+
+def _parse_percept_json(text: str, goal: str) -> dict:
+    """Parse VLM output JSON, with fallback to rule-based result."""
+    import json
+    text = (text or "").strip()
+    if text:
+        print(f"[VLM-RAW] {text[:400]}", flush=True)
+    if not text or "{" not in text:
+        return _perceive_rule(None, goal)
     try:
-        import torch
-        gen_cfg = dict(max_new_tokens=128, do_sample=False)
-        text = model.chat(tokenizer, pixel_values, prompt, gen_cfg)
-        torch.cuda.empty_cache()
-        text = (text or "").strip()
-        if text:
-            print(f"[VLM-RAW] {text[:400]}", flush=True)
-        if not text or "{" not in text:
-            return _perceive_rule(frame, goal)
         _js = text.rfind("{"); _je = text.rfind("}") + 1
         result = json.loads(text[_js:_je])
         if not result.get("target_visible", False):
             result["confidence"] = 0.0
             result["direction"]  = "not_visible"
         return result
+    except Exception:
+        return _perceive_rule(None, goal)
+
+
+def _perceive_vllm(frame: np.ndarray, goal: str,
+                   annotated_frame: np.ndarray = None,
+                   n_waypoints: int = 0,
+                   context: dict = None) -> dict:
+    """vLLM HTTP inference via OpenAI-compatible API."""
+    import requests
+
+    use_frame = annotated_frame if annotated_frame is not None else frame
+    b64 = _frame_to_jpeg_b64(use_frame)
+    prompt_text = _build_perceive_prompt(goal, n_waypoints, context)
+
+    payload = {
+        "model": _VLLM_MODEL,
+        "messages": [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+            {"type": "text",      "text": prompt_text},
+        ]}],
+        "max_tokens": 128,
+        "temperature": 0.0,
+    }
+    try:
+        resp = requests.post(
+            f"{_VLLM_BASE}/chat/completions",
+            json=payload,
+            timeout=30,
+        )
+        resp.raise_for_status()
+        text = resp.json()["choices"][0]["message"]["content"]
+        return _parse_percept_json(text, goal)
+    except Exception as e:
+        print(f"[vLLM] perceive error: {e}", flush=True)
+        return _perceive_rule(frame, goal)
+
+
+def _perceive_local(frame: np.ndarray, goal: str,
+                    annotated_frame: np.ndarray = None,
+                    n_waypoints: int = 0,
+                    context: dict = None) -> dict:
+    """InternVL3 local inference for visual perception."""
+    from PIL import Image
+
+    model, tokenizer = _get_local_model()
+    if model is None:
+        return _perceive_rule(frame, goal)
+
+    use_frame = annotated_frame if annotated_frame is not None else frame
+    pil = Image.fromarray(use_frame.astype(np.uint8))
+    pixel_values = _internvl_pixel_values(pil, max_num=4)
+
+    prompt_text = _build_perceive_prompt(goal, n_waypoints, context)
+    prompt = "<image>\n" + prompt_text
+
+    try:
+        import torch
+        gen_cfg = dict(max_new_tokens=128, do_sample=False)
+        text = model.chat(tokenizer, pixel_values, prompt, gen_cfg)
+        return _parse_percept_json(text, goal)
     except Exception as e:
         import torch
         torch.cuda.empty_cache()
@@ -230,13 +295,20 @@ def perceive(frame: np.ndarray, goal: str,
              context: dict = None) -> dict:
     """Analyse the current RGB frame with a VLM.
 
-    Uses InternVL3 locally if VLN_LOCAL_MODEL is set; otherwise Anthropic API;
-    otherwise rule-based fallback.
-    Returns {target_visible, direction, confidence, room, relevance}.
+    Priority: vLLM server → InternVL3 local → Anthropic API → rule-based.
     confidence forced to 0.0 when target_visible=False.
     """
+    if _VLLM_BASE:
+        return _perceive_vllm(frame, goal,
+                              annotated_frame=annotated_frame,
+                              n_waypoints=n_waypoints,
+                              context=context)
+
     if _LOCAL_MODEL_PATH:
-        return _perceive_local(frame, goal, annotated_frame=annotated_frame, n_waypoints=n_waypoints, context=context)
+        return _perceive_local(frame, goal,
+                               annotated_frame=annotated_frame,
+                               n_waypoints=n_waypoints,
+                               context=context)
 
     client = _get_client()
     if client is None:
@@ -276,7 +348,7 @@ def perceive(frame: np.ndarray, goal: str,
         except Exception:
             pass
         if attempt < 2:
-            time.sleep(0.3)
+            import time as _t; _t.sleep(0.3)
 
     if not text or "{" not in text:
         return _perceive_rule(frame, goal)
@@ -292,15 +364,14 @@ def perceive(frame: np.ndarray, goal: str,
 
 def classify_scene(frame, goal: str) -> dict:
     """Identify current room type (fires every ~20 steps). API-only."""
-    if _LOCAL_MODEL_PATH:
-        # Skip heavy API call when running local model; perception is enough
+    if _VLLM_BASE or _LOCAL_MODEL_PATH:
         return {"room": "other", "objects": [], "floor_hint": "unknown", "suggest": "none"}
 
     client = _get_client()
     if client is None:
         return {"room": "其他", "objects": [], "floor_hint": "unknown", "suggest": "none"}
 
-    import json, time
+    import json
     img_b64 = _frame_to_b64(frame)
     prompt = (
         f"你是家居导航机器人。导航目标：{goal}\n"
@@ -332,7 +403,7 @@ def classify_scene(frame, goal: str) -> dict:
         except Exception:
             pass
         if attempt < 1:
-            time.sleep(0.3)
+            import time as _t; _t.sleep(0.3)
 
     if not text or "{" not in text:
         return {"room": "其他", "objects": [], "floor_hint": "unknown", "suggest": "none"}
@@ -342,7 +413,7 @@ def classify_scene(frame, goal: str) -> dict:
         return {"room": "其他", "objects": [], "floor_hint": "unknown", "suggest": "none"}
 
 
-def _perceive_rule(frame: np.ndarray, goal: str) -> dict:
+def _perceive_rule(frame, goal: str) -> dict:
     """Rule-based fallback: report target not visible, trust semantic-map nav."""
     return {"target_visible": False, "direction": "not_visible", "distance": 99.0,
             "confidence": 0.0, "room": "other", "relevance": 0.2}
@@ -373,8 +444,36 @@ class DialogueAgent:
         self._history = []
 
     def parse_goal(self, user_input: str) -> Optional[str]:
-        """Extract a navigation goal keyword from a Chinese user utterance."""
-        # Primary: InternVL3 local zero-shot (~50ms, no network)
+        """Extract a navigation goal keyword from a user utterance."""
+        # Priority 1: vLLM server text-only (~20ms, no GPU memory overhead)
+        if _VLLM_BASE:
+            import requests
+            prompt_text = (
+                "Extract the navigation target object from the user instruction. "
+                "Return ONLY the object name (one word or short phrase, Chinese or English). "
+                f"User: '{user_input}'"
+            )
+            try:
+                resp = requests.post(
+                    f"{_VLLM_BASE}/chat/completions",
+                    json={
+                        "model": _VLLM_MODEL,
+                        "messages": [{"role": "user", "content": prompt_text}],
+                        "max_tokens": 16,
+                        "temperature": 0.0,
+                    },
+                    timeout=10,
+                )
+                resp.raise_for_status()
+                _goal = resp.json()["choices"][0]["message"]["content"].strip()
+                _goal = _goal.split('\n')[0].strip().rstrip('。，,.!')
+                if _goal:
+                    print(f'[PARSE_GOAL] vLLM: {user_input!r} → {_goal!r}', flush=True)
+                    return _goal
+            except Exception as e:
+                print(f'[PARSE_GOAL] vLLM failed: {e}', flush=True)
+
+        # Priority 2: InternVL3 local zero-shot (~50ms)
         model, tokenizer = _get_local_model()
         if model is not None:
             import torch
@@ -389,10 +488,13 @@ class DialogueAgent:
                 torch.cuda.empty_cache()
                 _goal = (_r or "").strip().split('\n')[0].strip().rstrip('。，,.!')
                 if _goal:
+                    print(f'[PARSE_GOAL] InternVL3: {user_input!r} → {_goal!r}', flush=True)
                     return _goal
             except Exception:
                 pass
-        # Fallback 1: Anthropic API (mimo)
+
+        # Priority 3: Anthropic API
+        print(f'[PARSE_GOAL] local unavailable, trying API: {user_input!r}', flush=True)
         client = _get_client()
         if client is not None:
             try:
@@ -409,6 +511,7 @@ class DialogueAgent:
                     return goal
             except Exception:
                 pass
+
         return self._rule_parse(user_input)
 
     def _rule_parse(self, text: str) -> Optional[str]:
