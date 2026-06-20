@@ -266,11 +266,18 @@ def run_task(
     llm_perceive=None,
     max_steps: int = MAX_STEPS,
     target_instances=None,
+    initial_explore_map=None,
+    initial_topo_map=None,
+    on_thought=None,
 ) -> dict:
     from agent.skills    import follow_path, verify_arrival
 
-    explore_map = ExploreMap()
-    topo_map    = TopoMap()
+    if initial_explore_map is not None:
+        initial_explore_map.value[:] = 0.0   # reset goal-specific heatmap
+        explore_map = initial_explore_map
+    else:
+        explore_map = ExploreMap()
+    topo_map = initial_topo_map if initial_topo_map is not None else TopoMap()
 
     instances = [np.asarray(p, dtype=np.float32) for p in target_instances] if target_instances else []
 
@@ -529,6 +536,10 @@ def run_task(
                 _vis4   = percept.get("target_visible", False)
                 if _skill:
                     _log(f"  [BRAIN step={step}] skill={_skill} reason={str(_reason)[:80]!r}")
+                    _r_clean = str(_reason).strip()
+                    _skip = {'str','other','not_visible','bathroom','','clear','clearly visible'}
+                    if on_thought and _r_clean not in _skip and len(_r_clean) >= 12:
+                        on_thought(step, _skill, _r_clean)
 
                 # BRAIN-SNAP: VLM says target visible, navigate now
                 if (_skill == "snap" and _vis4 and _conf4 >= 0.15
