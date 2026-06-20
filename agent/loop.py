@@ -299,6 +299,7 @@ def run_task(
         "last_scene":       {},
         "target_instances": instances,
         "blacklisted_snap": set(),   # XZ keys of SNAP targets pathfinder can't reach
+        "decision_history":  [],     # Last 3 VLM skill decisions for context injection
         "room_counts":    {},            # Phase 4: room visit counts for VLM context
         # Decision chain stats (accumulated per episode)
         "_stats": {
@@ -377,29 +378,28 @@ def run_task(
                     "stagnant_steps":   nav_state.get("stagnant_steps", 0),
                     "rooms_str":        _rooms_str,
                     "nearest_dist_str": f"{_idist_ctx:.1f}m" if _idist_ctx else "unknown",
+                    "history":          nav_state.get("decision_history", []),
                 }
 
-                # Phase 1: VLM-guided frontier selection (only when choosing a new frontier)
-                if (current_skill == "explore_frontier"
-                        and nav_state.get("target_pos") is None
-                        and nav_state.get("frontier_pos") is None):
-                    from agent.vlm_frontier import project_waypoint, annotate_frame
-                    _candidates = explore_map.top_k_frontiers(5, robot_pos)
-                    _visible = []
-                    for _score, _fpos in _candidates:
-                        _uv = project_waypoint(_fpos, robot_pos, R)
-                        if _uv is not None:
-                            _visible.append((_fpos, _uv))
-                    if len(_visible) >= 2:
-                        _ann = annotate_frame(
-                            nav_state["last_frame"],
-                            [_uv for _, _uv in _visible],
-                            [str(_i+1) for _i in range(len(_visible))],
-                        )
-                        percept = llm_perceive(_ann, task,
-                                               annotated_frame=_ann,
-                                               n_waypoints=len(_visible),
-                                               context=_ctx)
+                # Always annotate frontiers (AgentVLN: unified cross-space mapping)
+                from agent.vlm_frontier import project_waypoint, annotate_frame
+                _candidates = explore_map.top_k_frontiers(5, robot_pos)
+                _visible = []
+                for _score, _fpos in _candidates:
+                    _uv = project_waypoint(_fpos, robot_pos, R)
+                    if _uv is not None:
+                        _visible.append((_fpos, _uv))
+                if len(_visible) >= 2:
+                    _ann = annotate_frame(
+                        nav_state["last_frame"],
+                        [_uv for _, _uv in _visible],
+                        [str(_i+1) for _i in range(len(_visible))],
+                    )
+                    percept = llm_perceive(_ann, task,
+                                           annotated_frame=_ann,
+                                           n_waypoints=len(_visible),
+                                           context=_ctx)
+                    if nav_state.get("target_pos") is None and nav_state.get("frontier_pos") is None:
                         _choice = percept.get("waypoint", 0)
                         if 1 <= _choice <= len(_visible):
                             _chosen, _ = _visible[_choice - 1]
@@ -409,8 +409,6 @@ def run_task(
                             nav_state["waypoints"] = []
                             _log(f"  [VLM-FRONTIER step={step}] chose waypoint {_choice} "
                                  f"\u2192 ({_chosen[0]:.1f},{_chosen[2]:.1f})")
-                    else:
-                        percept = llm_perceive(nav_state["last_frame"], task, context=_ctx)
                 else:
                     percept = llm_perceive(nav_state["last_frame"], task, context=_ctx)
 
@@ -444,7 +442,7 @@ def run_task(
                 if _in_verify and vis:
                     _log(f"  [VLM decision] in verify_arrival → target_pos FROZEN (prevent oscillation)")
 
-                if vis and confidence >= VLM_CONF_THRESHOLD and not _in_verify:
+                if vis and not _in_verify:
                     depth = env.get_depth()
                     tgt   = _estimate_target_pos(
                         depth, direction, robot_pos, R)
@@ -526,8 +524,7 @@ def run_task(
                     _log(f"  [VLM decision] not visible → value_map update only (rel={rel:.2f})")
                 elif _in_verify:
                     pass  # already logged above
-                else:
-                    _log(f"  [VLM decision] vis=True but conf={confidence:.2f} < threshold={VLM_CONF_THRESHOLD} → ignored")
+                # (all vis=True cases handled above)
 
                 # ── Phase 4: VLM skill decisions ──────────────────────────
                 _skill  = percept.get("skill", "")
@@ -540,9 +537,13 @@ def run_task(
                     _skip = {'str','other','not_visible','bathroom','','clear','clearly visible'}
                     if on_thought and _r_clean not in _skip and len(_r_clean) >= 12:
                         on_thought(step, _skill, _r_clean)
+                    _dh = nav_state.setdefault("decision_history", [])
+                    _dh.append({"step": step, "skill": _skill, "reason": _r_clean[:60]})
+                    if len(_dh) > 3:
+                        _dh.pop(0)
 
                 # BRAIN-SNAP: VLM says target visible, navigate now
-                if (_skill == "snap" and _vis4 and _conf4 >= 0.15
+                if (_skill == "snap" and _vis4
                         and not _in_verify
                         and nav_state.get("target_pos") is None):
                     _depth4 = env.get_depth()
@@ -627,7 +628,7 @@ def run_task(
                       and nav_state.get("target_pos") is None
                       and current_skill != "verify_arrival"):
                     _vd4 = _inst_dist(robot_pos, instances)
-                    if _vd4 is not None and _vd4 <= 3.0 and instances:
+                    if _vd4 is not None and instances:
                         _rx4 = float(robot_pos[0]); _rz4 = float(robot_pos[2])
                         _vn4 = min(instances,
                                    key=lambda p: (float(p[0])-_rx4)**2+(float(p[2])-_rz4)**2)
