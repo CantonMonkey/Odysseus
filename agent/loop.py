@@ -270,7 +270,8 @@ def run_task(
     initial_topo_map=None,
     on_thought=None,
 ) -> dict:
-    from agent.skills    import follow_path, verify_arrival
+    from agent.skills import follow_path, verify_arrival  # ensures @skill decorators run
+    from agent.skill_registry import registered_skill_map
 
     if initial_explore_map is not None:
         initial_explore_map.value[:] = 0.0   # reset goal-specific heatmap
@@ -316,10 +317,7 @@ def run_task(
     if on_frame:
         on_frame(nav_state["last_frame"], nav_state)
 
-    skill_map = {
-        "follow_path":    follow_path,
-        "verify_arrival": verify_arrival,
-    }
+    skill_map = registered_skill_map()  # built from @skill registry
 
     prev_skill = "explore_frontier"
 
