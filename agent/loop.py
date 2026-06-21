@@ -590,6 +590,13 @@ def run_task(
                                 stats["snap_events"] += 1
                                 _log(f"  [BRAIN-SNAP step={step}] conf={_conf4:.2f} "
                                      f"\u2192 follow_path ({_n4[0]:.2f},{_n4[2]:.2f})")
+                        else:
+                            # No GT instances \u2014 use raw depth estimate (clean eval mode)
+                            nav_state["target_pos"]    = _tgt4.tolist()
+                            nav_state["current_skill"] = "follow_path"
+                            nav_state["waypoints"]     = []
+                            stats["snap_events"] += 1
+                            _log(f"  [BRAIN-SNAP step={step}] depth-only \u2192 ({_tgt4[0]:.2f},{_tgt4[2]:.2f})")
 
                 # BRAIN-ESCAPE: VLM says stuck, escape now (bypass 40-step wait)
                 elif (_skill == "escape"
@@ -650,6 +657,13 @@ def run_task(
                                                       float(_vn4[2])]
                         nav_state["current_skill"] = "verify_arrival"
                         _log(f"  [BRAIN-VERIFY step={step}] dist={_vd4:.2f}m \u2192 verify_arrival")
+                    elif not instances:
+                        # No GT \u2014 trust VLM: verify at robot's current navmesh position
+                        _pf_snap = env._sim.pathfinder.snap_point(robot_pos)
+                        _snap_pos = _pf_snap.tolist() if not np.any(np.isnan(_pf_snap)) else robot_pos.tolist()
+                        nav_state["target_pos"]    = _snap_pos
+                        nav_state["current_skill"] = "verify_arrival"
+                        _log(f"  [BRAIN-VERIFY step={step}] depth-only \u2192 verify_arrival at robot pos")
 
             except Exception as e:
                 _log(f"  [VLM ERROR step={step}] {e}")

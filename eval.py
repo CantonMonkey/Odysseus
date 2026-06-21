@@ -164,7 +164,10 @@ def _run_episode(
     env.step = _tracked_step  # type: ignore[assignment]
 
     try:
-        # 5. Run the navigation loop
+        # 5. Run the navigation loop.
+        # target_instances is intentionally NOT passed — the agent navigates
+        # purely from RGB-D + VLM perception, with no privileged GT coordinates.
+        # GT instance positions are only used below for metric computation.
         result = run_task(
             env,
             goal,
@@ -172,7 +175,7 @@ def _run_episode(
             on_frame=None,
             llm_perceive=llm_perceive,
             max_steps=max_steps,
-            target_instances=instances,
+            target_instances=[],
             initial_explore_map=initial_explore_map,
             initial_topo_map=initial_topo_map,
         )
@@ -310,7 +313,7 @@ def _run_chain_episode(
             result = run_task(
                 env, goal, scene_dir=scene_dir, on_frame=None,
                 llm_perceive=llm_perceive, max_steps=budget,
-                target_instances=instances,
+                target_instances=[],   # no GT coords in navigation
                 initial_explore_map=shared_explore,
                 initial_topo_map=shared_topo,
             )
