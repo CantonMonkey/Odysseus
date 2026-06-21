@@ -743,7 +743,8 @@ def run_task(
 
         # ── Update value map ───────────────────────────────────────────
         vlm_score = float(nav_state["last_percept"].get("relevance", 0.2))
-        explore_map.update(robot_pos, R, vlm_score)
+        _vmap_dir = nav_state["last_percept"].get("direction", "center")
+        explore_map.update(robot_pos, R, vlm_score, direction=_vmap_dir)
 
         # ── Stagnation / ESCAPE ────────────────────────────────────────
         if current_skill == "explore_frontier":
