@@ -36,28 +36,58 @@ from agent.semantic_map import CHINESE_TO_CATEGORY, IGNORE_CATEGORIES
 # Instance discovery (evaluation only — uses Habitat's semantic scene)
 # ---------------------------------------------------------------------------
 
-def _query_instances_from_sim(sim, goal: str) -> List[np.ndarray]:
-    """Return GT instance positions for *goal* from Habitat's semantic scene.
+def _load_all_instances(scene_dir: str, goals: List[str]) -> dict:
+    """Load GT instance positions for all goals using a temporary sim with the
+    annotated dataset config (which provides semantic_scene.objects in correct
+    Habitat world coordinates).
 
-    Uses sim.semantic_scene.objects (Habitat world coordinates) instead of
-    parsing the .semantic.glb vertex colors, which have a different coordinate
-    system and produce hundreds of voxel-grid positions that all fail geodesic.
+    The temporary sim is closed before HabitatEnv is created to avoid double
+    GPU allocation.  Falls back to semantic_map.query_target() if the annotated
+    config file is not present.
     """
-    keywords = CHINESE_TO_CATEGORY.get(goal, [goal.lower()])
-    positions = []
-    seen: set = set()
-    for obj in sim.semantic_scene.objects:
-        if obj is None or obj.category is None:
-            continue
-        name = obj.category.name().lower()
-        if any(k in name for k in keywords) and name not in IGNORE_CATEGORIES:
-            c = obj.aabb.center
-            key = (round(float(c[0]), 1), round(float(c[2]), 1))
-            if key not in seen:
-                seen.add(key)
-                positions.append(np.array([float(c[0]), float(c[1]), float(c[2])],
-                                          dtype=np.float32))
-    return positions
+    from pathlib import Path as _Path
+    from agent.semantic_map import query_target
+
+    scene_dir_p = _Path(scene_dir)
+    scene_id    = scene_dir_p.name.split("-", 1)[1]
+    scene_glb   = str(scene_dir_p / f"{scene_id}.basis.glb")
+    dataset_cfg = str(scene_dir_p.parent / "hm3d_annotated_basis.scene_dataset_config.json")
+
+    result: dict = {}
+
+    if _Path(dataset_cfg).exists():
+        cfg = habitat_sim.SimulatorConfiguration()
+        cfg.scene_id = scene_glb
+        cfg.scene_dataset_config_file = dataset_cfg
+        agent_cfg = habitat_sim.agent.AgentConfiguration()
+        agent_cfg.sensor_specifications = []
+        _sim = habitat_sim.Simulator(habitat_sim.Configuration(cfg, [agent_cfg]))
+        try:
+            for goal in goals:
+                keywords = CHINESE_TO_CATEGORY.get(goal, [goal.lower()])
+                positions, seen = [], set()
+                for obj in _sim.semantic_scene.objects:
+                    if obj is None or obj.category is None:
+                        continue
+                    name = obj.category.name().lower()
+                    if any(k in name for k in keywords) and name not in IGNORE_CATEGORIES:
+                        c = obj.aabb.center
+                        key = (round(float(c[0]), 1), round(float(c[2]), 1))
+                        if key not in seen:
+                            seen.add(key)
+                            positions.append(np.array(
+                                [float(c[0]), float(c[1]), float(c[2])], dtype=np.float32))
+                result[goal] = positions
+                print(f"  [semantic_scene] '{goal}': {len(positions)} instance(s)")
+        finally:
+            _sim.close()
+    else:
+        print(f"  [warn] annotated dataset config not found — using semantic_map fallback")
+        for goal in goals:
+            result[goal] = [np.asarray(p, dtype=np.float32)
+                            for p in query_target(scene_dir, goal)]
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -419,20 +449,20 @@ def run_evaluation(
     if goals is None:
         goals = ["沙发", "椅子", "床"]
 
+    # Query GT instances BEFORE creating HabitatEnv (temp sim, then closed)
+    print(f"[instance discovery] loading semantic scene ...")
+    all_gt_instances = _load_all_instances(scene_dir, goals)
+
     env = HabitatEnv(gpu_id=0)
     all_episodes: List[Dict[str, Any]] = []
     per_goal_episodes: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
 
-    # Load scene once to access semantic_scene for instance discovery
-    env.reset(scene_dir)
-
     for goal in goals:
         print(f"\n[goal: {goal}]")
 
-        # Retrieve GT positions from Habitat's semantic scene (correct world coords)
-        instances = _query_instances_from_sim(env._sim, goal)
+        instances = all_gt_instances.get(goal, [])
         if not instances:
-            print(f"  No instances found for '{goal}' in semantic scene — skipping goal")
+            print(f"  No instances found for '{goal}' — skipping goal")
             continue
 
         print(f"  {len(instances)} instance(s) found for '{goal}'")
@@ -470,9 +500,8 @@ def run_evaluation(
 
     if chain_goals and goals:
         # Run additional chain episodes (shared map across all goals per episode)
+        all_instances_map = all_gt_instances  # already loaded above
         env2 = HabitatEnv(gpu_id=0)
-        env2.reset(scene_dir)
-        all_instances_map = {g: _query_instances_from_sim(env2._sim, g) for g in goals}
         print(f"\n[chain eval: {goals}]")
         for ep_idx in range(n_episodes_per_goal):
             try:
