@@ -125,20 +125,30 @@ def _build_perceive_prompt(goal: str, n_waypoints: int = 0, context: dict = None
         waypoint_field = ""
 
     if context:
+        topo = context.get('topo_summary', '')
+        topo_line = f"Map memory: {topo}\n" if topo and topo != "0 nodes" else ""
+        history = context.get('history', [])
+        hist_line = ""
+        if history:
+            hist_parts = [f"step{h['step']}:{h['skill']}({h.get('reason','')[:30]})" for h in history]
+            hist_line = f"Recent decisions: {' → '.join(hist_parts)}\n"
         ctx_str = (
             f"Navigation state: step {context.get('step',0)}/{context.get('max_steps',500)}"
             f" | explored {context.get('explored_pct',0):.0%}"
             f" | stagnant {context.get('stagnant_steps',0)} steps\n"
             f"Rooms seen: {context.get('rooms_str','none yet')}\n"
             f"Nearest {goal}: {context.get('nearest_dist_str','unknown')}\n"
+            + topo_line + hist_line
         )
-        skill_field = ',"skill":"explore|snap|escape|verify","reason":"str"'
+        skill_field = ',"skill":"explore|snap|escape|verify","reason":"one sentence why"'
         skill_rules = (
             "Skill (choose one action for THIS step):\n"
             f"- \"snap\": {goal} is clearly visible, navigate to it NOW\n"
             "- \"explore\": keep searching, pick numbered waypoint (0=auto)\n"
             "- \"escape\": I am stuck/looping, need a completely different area\n"
             f"- \"verify\": I am very close to {goal}, confirm arrival\n"
+            f"- reason: ONE short sentence explaining your choice "
+            f"(e.g. \"{goal} visible on left side\", \"no {goal} found, continuing search\")\n"
         )
     else:
         ctx_str = ""
