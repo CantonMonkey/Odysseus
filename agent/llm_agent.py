@@ -51,9 +51,12 @@ def perceive(frame, goal: str,
 
 
 def classify_scene(frame, goal: str) -> dict:
-    """Identify current room type (fires every ~20 steps). API-only."""
-    if _VLLM_BASE or _LOCAL_MODEL_PATH:
+    """Identify current room type and navigation suggestion via VLM."""
+    if _vllm_backend is not None:
+        # vLLM: use perceive prompt (classify_scene not separately implemented for vLLM)
         return {"room": "other", "objects": [], "floor_hint": "unknown", "suggest": "none"}
+    if _local_backend is not None:
+        return _local_backend.classify_scene(frame, goal)
 
     client = _get_client()
     if client is None:

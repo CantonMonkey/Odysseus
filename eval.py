@@ -9,9 +9,10 @@ Standard ObjectNav metrics (HM3D / MP3D benchmarks):
   SoftSPL : same formula but replaces the binary success indicator with a
             soft distance reward  max(0, 1 - dist_to_nearest / success_dist)
 
-Ground-truth object positions are obtained via agent.semantic_map.query_target
-and geodesic distances via habitat_sim.ShortestPath.  These are ONLY used for
-metric computation; the agent itself navigates purely from RGB-D + VLM output.
+Ground-truth object positions are obtained from Habitat's sim.semantic_scene
+(correct world coordinates) and geodesic distances via habitat_sim.ShortestPath.
+These are ONLY used for metric computation; the agent navigates purely from
+RGB-D + VLM output.
 """
 
 import sys
@@ -29,7 +30,35 @@ if str(_PROJECT) not in sys.path:
 
 from agent.habitat_env import HabitatEnv
 from agent.loop import run_task
-from agent.semantic_map import query_target  # EVALUATION ONLY — not used by agent
+from agent.semantic_map import CHINESE_TO_CATEGORY, IGNORE_CATEGORIES
+
+# ---------------------------------------------------------------------------
+# Instance discovery (evaluation only — uses Habitat's semantic scene)
+# ---------------------------------------------------------------------------
+
+def _query_instances_from_sim(sim, goal: str) -> List[np.ndarray]:
+    """Return GT instance positions for *goal* from Habitat's semantic scene.
+
+    Uses sim.semantic_scene.objects (Habitat world coordinates) instead of
+    parsing the .semantic.glb vertex colors, which have a different coordinate
+    system and produce hundreds of voxel-grid positions that all fail geodesic.
+    """
+    keywords = CHINESE_TO_CATEGORY.get(goal, [goal.lower()])
+    positions = []
+    seen: set = set()
+    for obj in sim.semantic_scene.objects:
+        if obj is None or obj.category is None:
+            continue
+        name = obj.category.name().lower()
+        if any(k in name for k in keywords) and name not in IGNORE_CATEGORIES:
+            c = obj.aabb.center
+            key = (round(float(c[0]), 1), round(float(c[2]), 1))
+            if key not in seen:
+                seen.add(key)
+                positions.append(np.array([float(c[0]), float(c[1]), float(c[2])],
+                                          dtype=np.float32))
+    return positions
+
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -132,12 +161,10 @@ def _run_episode(
     L_star = _nearest_geodesic(pf, start_pos, instances)
 
     if L_star == float("inf"):
-        # No reachable instance — skip (not counted as failure)
-        print(
-            f"    [skip] goal={goal} ep={episode_idx}: "
-            "no reachable instance on navmesh"
-        )
-        return None
+        # Target not reachable from start — run anyway, counts as hard failure.
+        # VLM may still find the target via semantic reasoning (e.g. go upstairs).
+        print(f"    [warn] goal={goal} ep={episode_idx}: L*=inf (target unreachable from spawn) — running")
+        L_star = 99.0  # SPL denominator: failure gives SPL=0, success is rare but counted
 
     # 3. Set up llm_perceive
     if use_vlm:
@@ -396,13 +423,16 @@ def run_evaluation(
     all_episodes: List[Dict[str, Any]] = []
     per_goal_episodes: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
 
+    # Load scene once to access semantic_scene for instance discovery
+    env.reset(scene_dir)
+
     for goal in goals:
         print(f"\n[goal: {goal}]")
 
-        # Retrieve ground-truth positions ONCE per goal (evaluation only)
-        instances = [np.asarray(p, dtype=np.float32) for p in query_target(scene_dir, goal)]
+        # Retrieve GT positions from Habitat's semantic scene (correct world coords)
+        instances = _query_instances_from_sim(env._sim, goal)
         if not instances:
-            print(f"  No semantic-map instances found for '{goal}' — skipping goal")
+            print(f"  No instances found for '{goal}' in semantic scene — skipping goal")
             continue
 
         print(f"  {len(instances)} instance(s) found for '{goal}'")
@@ -440,11 +470,9 @@ def run_evaluation(
 
     if chain_goals and goals:
         # Run additional chain episodes (shared map across all goals per episode)
-        all_instances_map = {
-            g: [np.asarray(p, dtype=np.float32) for p in query_target(scene_dir, g)]
-            for g in goals
-        }
         env2 = HabitatEnv(gpu_id=0)
+        env2.reset(scene_dir)
+        all_instances_map = {g: _query_instances_from_sim(env2._sim, g) for g in goals}
         print(f"\n[chain eval: {goals}]")
         for ep_idx in range(n_episodes_per_goal):
             try:

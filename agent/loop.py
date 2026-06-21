@@ -23,6 +23,7 @@ from agent.topo_map   import TopoMap
 MAX_STEPS          = 500
 ARRIVE_DIST        = 1.2
 VLM_CONF_THRESHOLD = 0.25
+CLASSIFY_INTERVAL  = 24   # call classify_scene every N steps for room/floor reasoning
 
 from pathlib import Path
 _DATA     = Path("/data3/liangjy/vln/data/hm3d")
@@ -768,6 +769,35 @@ def run_task(
                 else:
                     nav_state["stagnant_steps"] = 0
                     _log(f"  [STUCK step={step}] isolated navmesh island, rotating")
+
+        # ── classify_scene: room/floor reasoning every CLASSIFY_INTERVAL steps ──
+        if (llm_perceive is not None
+                and step > 0
+                and step % CLASSIFY_INTERVAL == 0
+                and nav_state.get("current_skill") == "explore_frontier"
+                and nav_state.get("target_pos") is None):
+            try:
+                from agent.llm_agent import classify_scene as _classify
+                _cls = _classify(nav_state["last_frame"], task)
+                _sug = _cls.get("suggest", "none")
+                _rm  = _cls.get("room", "other")
+                _fh  = _cls.get("floor_hint", "unknown")
+                _objs = _cls.get("objects", [])
+                topo_map.add_node(robot_pos, _rm, _objs, step)
+                _log(f"  [CLASSIFY step={step}] room={_rm} floor={_fh} suggest={_sug} objects={_objs}")
+                if _sug == "go_upstairs" and not topo_map.has_explored_floor(1):
+                    stair = topo_map.find_staircase_approach(env, robot_pos)
+                    if stair is not None:
+                        from agent.skills import _replan
+                        wps = _replan(env, robot_pos, stair)
+                        if wps:
+                            nav_state["frontier_pos"]     = stair.tolist()
+                            nav_state["waypoints"]        = wps
+                            nav_state["anchor_steps_left"] = 60
+                            nav_state["explore_anchor"]   = stair.tolist()
+                            _log(f"  [GO-UPSTAIRS step={step}] → ({stair[0]:.1f},{stair[2]:.1f})")
+            except Exception as _ce:
+                _log(f"  [CLASSIFY ERROR step={step}] {_ce}")
 
         # ── Every-30-step progress summary ─────────────────────────────
         if step % 30 == 0:

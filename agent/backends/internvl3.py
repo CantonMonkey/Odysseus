@@ -106,6 +106,39 @@ class InternVL3Backend:
             print(f"[InternVL3] perceive error: {e}", flush=True)
             return RuleBasedBackend().perceive(frame, goal)
 
+    def classify_scene(self, frame, goal: str) -> dict:
+        """Room classification with floor hint and VLM navigation suggestion."""
+        import json
+        from PIL import Image
+        model, tokenizer = self._load()
+        if model is None:
+            return {"room": "other", "objects": [], "floor_hint": "unknown", "suggest": "none"}
+        pil = Image.fromarray(frame.astype(np.uint8))
+        pixel_values = _internvl_pixel_values(pil, max_num=4)
+        prompt = (
+            f"<image>\nYou are a home navigation robot. Goal: find {goal}.\n"
+            "Return ONE JSON line, no other text:\n"
+            '{"room":"living_room|bedroom|hallway|kitchen|staircase|bathroom|other",'
+            '"objects":["up to 3 visible items"],'
+            '"floor_hint":"ground|upper|unknown",'
+            '"suggest":"go_upstairs|search_room|keep_exploring|none"}\n'
+            "Rules for suggest:\n"
+            f"- go_upstairs: {goal} is typically in upstairs rooms (bed/wardrobe) "
+            "AND you see stairs or are on ground floor\n"
+            f"- search_room: current room likely contains {goal}, scan carefully\n"
+            "- keep_exploring: move to new area\n"
+            "- none: already navigating correctly"
+        )
+        try:
+            text = model.chat(tokenizer, pixel_values, prompt,
+                              dict(max_new_tokens=64, do_sample=False))
+            text = (text or "").strip()
+            if text and "{" in text:
+                return json.loads(text[text.find("{"):text.rfind("}")+1])
+        except Exception as e:
+            print(f"[InternVL3] classify_scene error: {e}", flush=True)
+        return {"room": "other", "objects": [], "floor_hint": "unknown", "suggest": "none"}
+
     def parse_goal(self, user_input: str) -> "str | None":
         model, tokenizer = self._load()
         if model is None:
