@@ -400,9 +400,11 @@ def visual_servo(env, nav_state):
     nav_state["servo_steps"] = servo_steps
 
     if servo_steps >= 50:
-        print(f"  [SERVO step={step}] 50 steps reached → stop (eval will judge dist)", flush=True)
-        nav_state["done"]          = True
-        nav_state["current_skill"] = "done"
+        print(f"  [SERVO step={step}] 50 steps reached → revert to explore", flush=True)
+        nav_state["current_skill"]   = "explore_frontier"
+        nav_state["servo_steps"]     = 0
+        nav_state["servo_lost"]      = 0
+        nav_state["vis_consecutive"] = 0
         return nav_state
 
     if direction == "left":
