@@ -741,6 +741,21 @@ def run_task(
         # ── Update value map ───────────────────────────────────────────
         vlm_score = float(nav_state["last_percept"].get("relevance", 0.2))
         _vmap_dir = nav_state["last_percept"].get("direction", "center")
+        _vmap_room = nav_state["last_percept"].get("room", "other")
+        # Room-semantic correction: VLM gives living_room=0.9 for ALL goals,
+        # making the value map goal-agnostic. Override with goal-aware room priors.
+        _ROOM_PRIOR = {
+            "沙发":  {"living_room": 0.9, "bedroom": 0.3, "hallway": 0.2, "kitchen": 0.05, "bathroom": 0.0},
+            "床":    {"bedroom": 0.95, "living_room": 0.15, "hallway": 0.1, "kitchen": 0.05, "bathroom": 0.0},
+            "电视":  {"living_room": 0.85, "bedroom": 0.5, "hallway": 0.1, "kitchen": 0.1, "bathroom": 0.0},
+            "桌子":  {"living_room": 0.8, "kitchen": 0.7, "bedroom": 0.4, "hallway": 0.1, "bathroom": 0.05},
+            "冰箱":  {"kitchen": 0.95, "living_room": 0.1, "hallway": 0.05, "bedroom": 0.0, "bathroom": 0.0},
+            "椅子":  {"living_room": 0.8, "kitchen": 0.7, "bedroom": 0.5, "hallway": 0.2, "bathroom": 0.0},
+        }
+        _prior = _ROOM_PRIOR.get(task, {}).get(_vmap_room, None)
+        if _prior is not None:
+            # Blend: 70% room prior + 30% VLM relevance (retains some per-frame signal)
+            vlm_score = 0.7 * _prior + 0.3 * vlm_score
         explore_map.update(robot_pos, R, vlm_score, direction=_vmap_dir)
 
         # ── Stagnation / ESCAPE ────────────────────────────────────────
