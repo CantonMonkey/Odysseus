@@ -9,6 +9,7 @@ Three reusable navigation skills:
 
 import numpy as np
 import habitat_sim
+from agent.skill_registry import skill
 
 try:
     import quaternion as npq
@@ -81,6 +82,7 @@ def _euclidean(a: np.ndarray, b) -> float:
 # Primary navigation skill: query pathfinder for the shortest path,
 # then advance waypoint by waypoint using rotation-matrix heading.
 
+@skill("follow_path")
 def follow_path(env, nav_state: dict) -> dict:
     """Follow the Habitat pathfinder shortest path toward the goal.
 
@@ -210,6 +212,7 @@ def search_room(env, nav_state: dict) -> dict:
 
 # ── Skill 3: verify_arrival ─────────────────────────────────────
 
+@skill("verify_arrival")
 def verify_arrival(env, nav_state: dict) -> dict:
     """Confirm arrival at goal.
 
