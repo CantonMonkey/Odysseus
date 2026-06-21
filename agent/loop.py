@@ -303,6 +303,7 @@ def run_task(
         "blacklisted_snap": set(),   # XZ keys of SNAP targets pathfinder can't reach
         "decision_history":  [],     # Last 3 VLM skill decisions for context injection
         "room_counts":    {},        # Phase 4: room visit counts for VLM context
+        "room_vlm_history": [],     # last 8 VLM-reported room labels (loop detection)
         "step_log":       [],        # Structured per-VLM-call log (exported as JSON)
         # Decision chain stats (accumulated per episode)
         "_stats": {
@@ -418,6 +419,10 @@ def run_task(
                 # Track room visits for Phase 4 context
                 _rm = percept.get("room", "other")
                 nav_state["room_counts"][_rm] = nav_state["room_counts"].get(_rm, 0) + 1
+                _rvh = nav_state.setdefault("room_vlm_history", [])
+                _rvh.append(_rm)
+                if len(_rvh) > 8:
+                    _rvh.pop(0)
                 stats["vlm_calls"] += 1
                 nav_state["step_log"].append({
                     "step":           step,
@@ -524,7 +529,14 @@ def run_task(
                                 tgt = None
                                 nav_state["stagnant_steps"] = nav_state.get("stagnant_steps", 0) + 20
                         else:
-                            _log(f"  [SNAP step={step}] no instance list → using raw depth estimate ({tgt[0]:.2f},{tgt[2]:.2f})")
+                            # No GT instances: depth estimate is unreliable.
+                            # Clear any stale target so robot stays in explore_frontier.
+                            tgt = None
+                            if not nav_state.get("target_instances") and nav_state.get("current_skill") == "follow_path":
+                                nav_state["target_pos"] = None
+                                nav_state["current_skill"] = "explore_frontier"
+                                nav_state["waypoints"] = []
+                            _log(f"  [SNAP step={step}] no instance list → value-map explore (skip snap)")
 
                         if tgt is not None:
                             old_skill = nav_state.get("current_skill")
@@ -534,6 +546,7 @@ def run_task(
                             if old_skill != "follow_path":
                                 _log(f"  [VLM decision] {old_skill} → follow_path (target detected conf={confidence:.2f})")
                 elif not vis:
+                    nav_state["vis_stable_count"] = 0  # reset streak on not-visible
                     _log(f"  [VLM decision] not visible → value_map update only (rel={rel:.2f})")
                 elif _in_verify:
                     pass  # already logged above
@@ -551,7 +564,7 @@ def run_task(
                     if on_thought and _r_clean not in _skip and len(_r_clean) >= 12:
                         on_thought(step, _skill, _r_clean)
                     _dh = nav_state.setdefault("decision_history", [])
-                    _dh.append({"step": step, "skill": _skill, "reason": _r_clean[:60]})
+                    _dh.append({"step": step, "skill": _skill, "reason": _r_clean[:60], "room": percept.get("room", "other")})
                     if len(_dh) > 3:
                         _dh.pop(0)
 
@@ -590,12 +603,10 @@ def run_task(
                                 _log(f"  [BRAIN-SNAP step={step}] conf={_conf4:.2f} "
                                      f"\u2192 follow_path ({_n4[0]:.2f},{_n4[2]:.2f})")
                         else:
-                            # No GT instances \u2014 use raw depth estimate (clean eval mode)
-                            nav_state["target_pos"]    = _tgt4.tolist()
-                            nav_state["current_skill"] = "follow_path"
-                            nav_state["waypoints"]     = []
-                            stats["snap_events"] += 1
-                            _log(f"  [BRAIN-SNAP step={step}] depth-only \u2192 ({_tgt4[0]:.2f},{_tgt4[2]:.2f})")
+                            # No GT instances: depth estimate is foreground-dominated and
+                            # unreliable as a navigation target. Skip follow_path entirely;
+                            # let value-map exploration guide naturally (VLFM-style).
+                            _log(f"  [BRAIN-SNAP step={step}] depth-only \u2192 skip (no GT instances)")
 
                 # BRAIN-ESCAPE: VLM says stuck, escape now (bypass 40-step wait)
                 elif (_skill == "escape"
@@ -663,6 +674,69 @@ def run_task(
                         nav_state["target_pos"]    = _snap_pos
                         nav_state["current_skill"] = "verify_arrival"
                         _log(f"  [BRAIN-VERIFY step={step}] depth-only \u2192 verify_arrival at robot pos")
+
+                # \u2500\u2500 Room-step budget: escape if same room for 6 VLM calls \u2500\u2500
+                _ROOM_VLM_BUDGET = 6
+                if (current_skill == "explore_frontier"
+                        and nav_state.get("anchor_steps_left", 0) <= 0
+                        and nav_state.get("target_pos") is None):
+                    _rvh2 = nav_state.get("room_vlm_history", [])
+                    if len(_rvh2) >= _ROOM_VLM_BUDGET:
+                        _recent = _rvh2[-_ROOM_VLM_BUDGET:]
+                        _unique = set(r for r in _recent if r and r != "other")
+                        if len(_unique) == 1:
+                            _stuck_room = list(_unique)[0]
+                            _log(f"  [ROOM-BUDGET step={step}] stuck in '{_stuck_room}' "
+                                 f"for {_ROOM_VLM_BUDGET} VLM calls \u2192 semantic escape")
+                            from agent.skills import _replan
+                            # Prefer known nodes in a DIFFERENT room type
+                            _alts = [n for n in topo_map.nodes
+                                     if n.room not in (_stuck_room, "other")]
+                            _done_escape = False
+                            if _alts:
+                                _ne = min(_alts, key=lambda n: float(np.linalg.norm(n.pos - robot_pos)))
+                                _wps_re = _replan(env, robot_pos, _ne.pos)
+                                if _wps_re:
+                                    nav_state["frontier_pos"]      = _ne.pos.tolist()
+                                    nav_state["waypoints"]         = _wps_re
+                                    nav_state["failed_frontiers"]  = set()
+                                    nav_state["stagnant_steps"]    = 0
+                                    nav_state["room_vlm_history"]  = []
+                                    nav_state["explore_anchor"]    = _ne.pos.tolist()
+                                    nav_state["anchor_steps_left"] = 100
+                                    nav_state["blacklisted_snap"]  = set()
+                                    stats["escape_events"] += 1
+                                    _done_escape = True
+                                    _log(f"  [ROOM-ESCAPE step={step}] \u2192 topo node "
+                                         f"room={_ne.room} ({_ne.pos[0]:.1f},{_ne.pos[2]:.1f})")
+                            if not _done_escape:
+                                # No known other-room nodes yet \u2192 unexplored random
+                                _pf_re = env._sim.pathfinder
+                                _re_cands = []
+                                for _ in range(40):
+                                    _rp_re = _pf_re.get_random_navigable_point()
+                                    if not any(np.isnan(_rp_re)) and abs(_rp_re[1] - robot_pos[1]) < 1.0:
+                                        _d_re = float(np.linalg.norm(np.array(_rp_re) - robot_pos))
+                                        if _d_re > 5.0:
+                                            _gi_re, _gj_re = explore_map._w2g(_rp_re[0], _rp_re[2])
+                                            if explore_map._valid(_gi_re, _gj_re) and explore_map.grid[_gi_re, _gj_re] == 0:
+                                                _wps_re2 = _replan(env, robot_pos, _rp_re)
+                                                if _wps_re2:
+                                                    _re_cands.append((_d_re, _rp_re.tolist(), _wps_re2))
+                                if _re_cands:
+                                    _re_cands.sort(key=lambda x: -x[0])
+                                    _bd_re, _rpl_re, _wps_re3 = _re_cands[0]
+                                    nav_state["frontier_pos"]      = _rpl_re
+                                    nav_state["waypoints"]         = _wps_re3
+                                    nav_state["failed_frontiers"]  = set()
+                                    nav_state["stagnant_steps"]    = 0
+                                    nav_state["room_vlm_history"]  = []
+                                    nav_state["explore_anchor"]    = _rpl_re
+                                    nav_state["anchor_steps_left"] = 100
+                                    nav_state["blacklisted_snap"]  = set()
+                                    stats["escape_events"] += 1
+                                    _log(f"  [ROOM-ESCAPE step={step}] \u2192 unexplored random "
+                                         f"({_rpl_re[0]:.1f},{_rpl_re[2]:.1f}) dist={_bd_re:.1f}m")
 
             except Exception as e:
                 _log(f"  [VLM ERROR step={step}] {e}")

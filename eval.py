@@ -15,6 +15,7 @@ These are ONLY used for metric computation; the agent navigates purely from
 RGB-D + VLM output.
 """
 
+import os
 import sys
 import numpy as np
 import habitat_sim
@@ -23,8 +24,24 @@ from typing import List, Optional, Dict, Any
 import json
 from collections import defaultdict
 
-# Project root on the server
-_PROJECT = Path("/data3/liangjy/vln/Odysseus")
+# Load .env before anything else so VLN_DATA_DIR etc. are available
+def _load_dotenv(path: Path):
+    if not path.exists():
+        return
+    with open(path) as _f:
+        for _line in _f:
+            _line = _line.strip()
+            if not _line or _line.startswith("#") or "=" not in _line:
+                continue
+            _k, _, _v = _line.partition("=")
+            _k = _k.strip()
+            _v = _v.strip().strip('"').strip("'")
+            if _k and _k not in os.environ:
+                os.environ[_k] = _v
+_load_dotenv(Path(__file__).parent / ".env")
+
+# Project root — prefer current directory, fall back to legacy hardcoded path
+_PROJECT = Path(os.environ.get("VLN_PROJECT_DIR", str(Path(__file__).parent.resolve())))
 if str(_PROJECT) not in sys.path:
     sys.path.insert(0, str(_PROJECT))
 
@@ -95,7 +112,7 @@ def _load_all_instances(scene_dir: str, goals: List[str]) -> dict:
 # ---------------------------------------------------------------------------
 
 SUCCESS_DIST = 1.5           # metres (bounding-box centroids overestimate dist by ~0.5m for tall objects)
-DATA_DIR     = Path("/data3/liangjy/vln/data/hm3d")
+DATA_DIR      = Path(os.environ.get("VLN_DATA_DIR", "/data3/liangjy/vln/data/hm3d"))
 DEFAULT_SCENE = str(DATA_DIR / "00800-TEEsavR23oF")
 
 
