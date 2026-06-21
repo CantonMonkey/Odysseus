@@ -30,7 +30,7 @@ EYE_HEIGHT   = 1.0   # camera height on a wheeled robot (m)
 FORWARD_STEP = 0.25  # distance per move_forward step (m)
 TURN_DEG     = 15.0  # degrees per turn step
 
-DATA_DIR = Path("/data3/liangjy/vln/data/hm3d")
+DATA_DIR = Path(os.environ.get("VLN_DATA_DIR", "/data3/liangjy/vln/data/hm3d"))
 
 
 def _make_config(scene_glb: str, gpu_id: int = 0) -> habitat_sim.Configuration:
