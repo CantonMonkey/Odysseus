@@ -300,7 +300,8 @@ def run_task(
         "target_instances": instances,
         "blacklisted_snap": set(),   # XZ keys of SNAP targets pathfinder can't reach
         "decision_history":  [],     # Last 3 VLM skill decisions for context injection
-        "room_counts":    {},            # Phase 4: room visit counts for VLM context
+        "room_counts":    {},        # Phase 4: room visit counts for VLM context
+        "step_log":       [],        # Structured per-VLM-call log (exported as JSON)
         # Decision chain stats (accumulated per episode)
         "_stats": {
             "vlm_calls": 0, "vlm_visible": 0, "snap_events": 0,
@@ -379,6 +380,7 @@ def run_task(
                     "rooms_str":        _rooms_str,
                     "nearest_dist_str": f"{_idist_ctx:.1f}m" if _idist_ctx else "unknown",
                     "history":          nav_state.get("decision_history", []),
+                    "topo_summary":     topo_map.summary(),
                 }
 
                 # Always annotate frontiers (AgentVLN: unified cross-space mapping)
@@ -418,6 +420,18 @@ def run_task(
                 _rm = percept.get("room", "other")
                 nav_state["room_counts"][_rm] = nav_state["room_counts"].get(_rm, 0) + 1
                 stats["vlm_calls"] += 1
+                nav_state["step_log"].append({
+                    "step":           step,
+                    "skill":          percept.get("skill", ""),
+                    "reason":         percept.get("reason", ""),
+                    "confidence":     float(percept.get("confidence", 0.0)),
+                    "target_visible": bool(percept.get("target_visible", False)),
+                    "room":           percept.get("room", "other"),
+                    "direction":      percept.get("direction", "not_visible"),
+                    "robot_pos":      robot_pos.tolist(),
+                    "topo_nodes":     topo_map.node_count,
+                    "explored_pct":   explore_map.explored_fraction(),
+                })
 
                 confidence = float(percept.get("confidence", 0.0))
                 vis        = percept.get("target_visible", False)

@@ -102,6 +102,9 @@ def _run_episode(
     use_vlm: bool,
     episode_idx: int,
     spawn_pos: Optional[np.ndarray] = None,
+    log_dir: Optional[str] = None,
+    initial_explore_map=None,
+    initial_topo_map=None,
 ) -> Optional[Dict[str, Any]]:
     """Run one episode and return metrics, or None if episode is unreachable.
 
@@ -170,6 +173,8 @@ def _run_episode(
             llm_perceive=llm_perceive,
             max_steps=max_steps,
             target_instances=instances,
+            initial_explore_map=initial_explore_map,
+            initial_topo_map=initial_topo_map,
         )
     finally:
         env.step = _original_step  # restore
@@ -201,7 +206,8 @@ def _run_episode(
         f"dist={dist_to_nearest:.2f}m L*={L_star:.1f}m spl={spl:.3f} steps={steps} "
         f"spawn=({start_pos[0]:.1f},{start_pos[2]:.1f})"
     )
-    return {
+
+    ep_result = {
         "success":         success,
         "spl":             spl,
         "soft_spl":        soft_spl,
@@ -213,6 +219,138 @@ def _run_episode(
         "episode":         episode_idx,
         "spawn_pos":       start_pos.tolist(),
     }
+
+    # Write structured per-step VLM log as JSON sidecar
+    step_log = result.get("step_log", [])
+    if step_log and log_dir:
+        _sidecar = Path(log_dir) / f"steplog_{goal}_ep{episode_idx:02d}.json"
+        try:
+            _sidecar.write_text(json.dumps({
+                "episode": ep_result,
+                "steps":   step_log,
+            }, ensure_ascii=False, indent=2))
+            print(f"    [log] {_sidecar}")
+        except Exception as _e:
+            print(f"    [log] sidecar write failed: {_e}")
+
+    return ep_result
+
+
+# ---------------------------------------------------------------------------
+# Multi-goal chained episode
+# ---------------------------------------------------------------------------
+
+def _run_chain_episode(
+    env: HabitatEnv,
+    scene_dir: str,
+    goals: List[str],
+    all_instances: Dict[str, List[np.ndarray]],
+    max_steps_total: int,
+    use_vlm: bool,
+    episode_idx: int,
+    spawn_pos: Optional[np.ndarray] = None,
+    log_dir: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Run all goals sequentially in one episode with shared explore/topo maps.
+
+    Implements continuous multi-goal navigation:  after reaching goal N the
+    agent continues from its current position towards goal N+1, retaining the
+    same occupancy grid and topological memory.  Steps budget is shared across
+    all goals.
+    """
+    from agent.explore_map import ExploreMap
+    from agent.topo_map   import TopoMap
+    import math
+
+    frame = env.reset(scene_dir, start_pos=spawn_pos)
+    start_pos_chain, _ = env.get_robot_pose()
+
+    if use_vlm:
+        try:
+            from agent.llm_agent import perceive
+            llm_perceive = lambda fr, g, **kw: perceive(fr, g, **kw)
+        except ImportError:
+            llm_perceive = None
+    else:
+        llm_perceive = None
+
+    shared_explore = ExploreMap()
+    shared_topo    = TopoMap()
+    results        = []
+    steps_used     = 0
+    max_per_goal   = math.ceil(max_steps_total / len(goals))
+
+    path_all: List[np.ndarray] = [start_pos_chain.copy()]
+    _original_step = env.step
+
+    def _tracked_step(action):
+        r = _original_step(action)
+        pos, _ = env.get_robot_pose()
+        path_all.append(pos.copy())
+        return r
+
+    env.step = _tracked_step  # type: ignore[assignment]
+
+    try:
+        for gi, goal in enumerate(goals):
+            instances = all_instances.get(goal, [])
+            if not instances:
+                print(f"    [chain] goal={goal}: no instances, skip")
+                continue
+            cur_pos, _ = env.get_robot_pose()
+            L_star = _nearest_geodesic(env._sim.pathfinder, cur_pos, instances)
+            if L_star == float("inf"):
+                print(f"    [chain] goal={goal}: unreachable, skip")
+                continue
+
+            steps_left = max_steps_total - steps_used
+            budget     = min(max_per_goal, steps_left)
+            path_before = len(path_all)
+
+            result = run_task(
+                env, goal, scene_dir=scene_dir, on_frame=None,
+                llm_perceive=llm_perceive, max_steps=budget,
+                target_instances=instances,
+                initial_explore_map=shared_explore,
+                initial_topo_map=shared_topo,
+            )
+            steps_used += result.get("step_count", 0)
+
+            path_seg = path_all[path_before:]
+            p_seg = sum(
+                float(np.linalg.norm(path_seg[i] - path_seg[i-1]))
+                for i in range(1, len(path_seg))
+            ) if len(path_seg) > 1 else 0.0
+
+            final_pos, _ = env.get_robot_pose()
+            dist = _nearest_euclidean(final_pos, instances)
+            success = dist < SUCCESS_DIST
+            denom   = max(L_star, p_seg)
+            spl     = (float(success) * L_star / denom) if denom > 0 else 0.0
+
+            ep_r = {
+                "success": success, "spl": spl,
+                "dist_to_nearest": dist, "path_length": p_seg,
+                "geodesic_dist": L_star, "steps": result.get("step_count", 0),
+                "goal": goal, "episode": episode_idx, "chain_idx": gi,
+                "spawn_pos": start_pos_chain.tolist(),
+            }
+            print(f"    [chain gi={gi}] goal={goal} success={success} "
+                  f"dist={dist:.2f}m steps={ep_r['steps']}")
+            results.append(ep_r)
+
+            step_log = result.get("step_log", [])
+            if step_log and log_dir:
+                _s = Path(log_dir) / f"chain_steplog_{goal}_ep{episode_idx:02d}.json"
+                try:
+                    _s.write_text(json.dumps({"episode": ep_r, "steps": step_log},
+                                             ensure_ascii=False, indent=2))
+                except Exception:
+                    pass
+    finally:
+        env.step = _original_step
+
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -226,6 +364,8 @@ def run_evaluation(
     max_steps: int = 200,
     use_vlm: bool = True,
     spawn_positions: Optional[Dict[str, Any]] = None,
+    log_dir: Optional[str] = None,
+    chain_goals: bool = False,
 ) -> Dict[str, Any]:
     """Run ObjectNav evaluation and return aggregated metrics.
 
@@ -282,6 +422,7 @@ def run_evaluation(
                     use_vlm=use_vlm,
                     episode_idx=ep_idx,
                     spawn_pos=_spawn,
+                    log_dir=log_dir,
                 )
             except Exception as _e:
                 print(f"    [error] ep={ep_idx}: {_e}")
@@ -293,6 +434,35 @@ def run_evaluation(
             per_goal_episodes[goal].append(ep_result)
 
     env.close()
+
+    if chain_goals and goals:
+        # Run additional chain episodes (shared map across all goals per episode)
+        all_instances_map = {
+            g: [np.asarray(p, dtype=np.float32) for p in query_target(scene_dir, g)]
+            for g in goals
+        }
+        env2 = HabitatEnv(gpu_id=0)
+        print(f"\n[chain eval: {goals}]")
+        for ep_idx in range(n_episodes_per_goal):
+            try:
+                chain_eps = _run_chain_episode(
+                    env=env2,
+                    scene_dir=scene_dir,
+                    goals=goals,
+                    all_instances=all_instances_map,
+                    max_steps_total=max_steps * len(goals),
+                    use_vlm=use_vlm,
+                    episode_idx=ep_idx,
+                    log_dir=log_dir,
+                )
+            except Exception as _e:
+                print(f"    [chain error] ep={ep_idx}: {_e}")
+                chain_eps = []
+            for ep_r in chain_eps:
+                g = ep_r["goal"]
+                all_episodes.append(ep_r)
+                per_goal_episodes[g].append(ep_r)
+        env2.close()
 
     # Aggregate per-goal metrics
     per_goal: Dict[str, Any] = {}
@@ -410,11 +580,16 @@ if __name__ == "__main__":
                         help="Disable VLM perception (blind agent)")
     parser.add_argument("--spawn-file", default=None,
                         help="JSON file of fixed spawn positions. Load if exists, save if not.")
+    parser.add_argument("--log-dir", default="/tmp",
+                        help="Directory for per-step JSON sidelogs (default: /tmp)")
+    parser.add_argument("--chain-goals", action="store_true",
+                        help="Run all goals sequentially in one episode (shared topo/explore maps)")
     args = parser.parse_args()
 
-    print(f"Scene   : {args.scene}")
-    print(f"Goals   : {args.goals}")
-    print(f"Eps/goal: {args.episodes}  max_steps: {args.max_steps}  vlm: {not args.no_vlm}")
+    print(f"Scene     : {args.scene}")
+    print(f"Goals     : {args.goals}")
+    print(f"Eps/goal  : {args.episodes}  max_steps: {args.max_steps}  vlm: {not args.no_vlm}")
+    print(f"Chain mode: {args.chain_goals}  log_dir: {args.log_dir}")
 
     spawn_positions = None
     if args.spawn_file:
@@ -433,6 +608,8 @@ if __name__ == "__main__":
         max_steps=args.max_steps,
         use_vlm=not args.no_vlm,
         spawn_positions=spawn_positions,
+        log_dir=args.log_dir,
+        chain_goals=args.chain_goals,
     )
 
     if args.spawn_file and spawn_positions is None:
