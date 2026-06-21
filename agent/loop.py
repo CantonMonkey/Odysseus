@@ -457,10 +457,11 @@ def run_task(
                     topo_map.add_node(robot_pos, room, [], step)
 
                 _in_verify = nav_state.get("current_skill") == "verify_arrival"
+                _in_servo  = nav_state.get("current_skill") == "visual_servo"
                 if _in_verify and vis:
                     _log(f"  [VLM decision] in verify_arrival → target_pos FROZEN (prevent oscillation)")
 
-                if vis and not _in_verify:
+                if vis and not _in_verify and not _in_servo:
                     depth = env.get_depth()
                     tgt   = _estimate_target_pos(
                         depth, direction, robot_pos, R)
@@ -571,6 +572,7 @@ def run_task(
                 # BRAIN-SNAP: VLM says target visible, navigate now
                 if (_skill == "snap" and _vis4
                         and not _in_verify
+                        and not _in_servo
                         and nav_state.get("target_pos") is None):
                     _depth4 = env.get_depth()
                     _dir4   = percept.get("direction", "center")
@@ -607,6 +609,24 @@ def run_task(
                             # unreliable as a navigation target. Skip follow_path entirely;
                             # let value-map exploration guide naturally (VLFM-style).
                             _log(f"  [BRAIN-SNAP step={step}] depth-only \u2192 skip (no GT instances)")
+
+                # VISUAL SERVO: target visible with high confidence, no GT instances.
+                # Switch to reactive tracking: turn toward VLM direction each step.
+                # Requires 2 consecutive sightings to avoid single-frame false positives.
+                if (vis and _conf4 >= 0.65
+                        and not instances
+                        and not _in_verify
+                        and not _in_servo
+                        and nav_state.get("current_skill") not in ("follow_path", "done")):
+                    _vsc = nav_state.get("vis_consecutive", 0) + 1
+                    nav_state["vis_consecutive"] = _vsc
+                    if _vsc >= 2:
+                        nav_state["current_skill"] = "visual_servo"
+                        nav_state["servo_steps"]   = 0
+                        nav_state["servo_lost"]    = 0
+                        _log(f"  [SERVO trigger step={step}] vis_consecutive={_vsc} conf={_conf4:.2f} dir={direction} \u2192 visual_servo")
+                elif not vis:
+                    nav_state["vis_consecutive"] = 0
 
                 # BRAIN-ESCAPE: VLM says stuck, escape now (bypass 40-step wait)
                 elif (_skill == "escape"
@@ -753,9 +773,11 @@ def run_task(
             "椅子":  {"living_room": 0.8, "kitchen": 0.7, "bedroom": 0.5, "hallway": 0.2, "bathroom": 0.0},
         }
         _prior = _ROOM_PRIOR.get(task, {}).get(_vmap_room, None)
+        _raw_score = vlm_score
         if _prior is not None:
             # Blend: 70% room prior + 30% VLM relevance (retains some per-frame signal)
             vlm_score = 0.7 * _prior + 0.3 * vlm_score
+        _log(f"  [VMAP step={step}] room={_vmap_room} prior={_prior} raw={_raw_score:.2f} → score={vlm_score:.2f} dir={_vmap_dir}")
         explore_map.update(robot_pos, R, vlm_score, direction=_vmap_dir)
 
         # ── Stagnation / ESCAPE ────────────────────────────────────────

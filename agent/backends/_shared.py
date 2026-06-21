@@ -34,6 +34,7 @@ def _build_perceive_prompt(goal: str, n_waypoints: int = 0, context: dict = None
 
     topo_line = ""
     history_str = ""
+    anti_loop_alert = ""
     if context:
         topo = context.get('topo_summary', '')
         if topo and topo != "0 nodes":
@@ -43,6 +44,15 @@ def _build_perceive_prompt(goal: str, n_waypoints: int = 0, context: dict = None
             history_str = "Recent decisions: " + " → ".join(
                 f"step{e['step']}:{e['skill']}({e.get('reason','')[:30]})" for e in _h
             ) + "\n"
+            # Detect room loop: if last 3 entries all report the same non-trivial room
+            _recent_rooms = [e.get("room", "") for e in _h if e.get("room") and e.get("room") != "other"]
+            if len(_recent_rooms) >= 3 and len(set(_recent_rooms)) == 1:
+                anti_loop_alert = (
+                    f"WARNING: You have been in '{_recent_rooms[0]}' for {len(_recent_rooms)} "
+                    f"consecutive VLM calls without finding {goal}. "
+                    f"If {goal} is STILL not visible, you MUST choose skill=escape "
+                    f"and select a waypoint leading to a DIFFERENT area or room.\n"
+                )
 
     if context:
         ctx_str = (
@@ -51,7 +61,7 @@ def _build_perceive_prompt(goal: str, n_waypoints: int = 0, context: dict = None
             f" | stagnant {context.get('stagnant_steps', 0)} steps\n"
             f"Rooms seen: {context.get('rooms_str', 'none yet')}\n"
             f"Nearest {goal}: {context.get('nearest_dist_str', 'unknown')}\n"
-            + topo_line + history_str
+            + topo_line + history_str + anti_loop_alert
         )
         skill_field = ',"skill":"explore|snap|escape|verify","reason":"one sentence why"'
         skill_rules = (
@@ -68,6 +78,19 @@ def _build_perceive_prompt(goal: str, n_waypoints: int = 0, context: dict = None
         skill_field = ""
         skill_rules = ""
 
+    # Goal-specific room relevance hints for commonsense reasoning
+    _ROOM_HINTS = {
+        "沙发": "living_room=0.9, bedroom=0.15, hallway=0.3, kitchen=0.0",
+        "床":   "bedroom=0.95, living_room=0.1, hallway=0.2, kitchen=0.0",
+        "电视": "living_room=0.85, bedroom=0.45, hallway=0.1, kitchen=0.05",
+        "桌子": "kitchen=0.8, living_room=0.75, bedroom=0.3, hallway=0.1",
+        "冰箱": "kitchen=0.95, living_room=0.05, bedroom=0.0, hallway=0.05",
+        "椅子": "living_room=0.8, kitchen=0.75, bedroom=0.45, hallway=0.2",
+        "厕所": "bathroom=0.95, hallway=0.3, bedroom=0.1, living_room=0.0",
+        "水槽": "bathroom=0.8, kitchen=0.85, hallway=0.1, living_room=0.0",
+    }
+    _room_hint = _ROOM_HINTS.get(goal, "use common sense about which rooms typically contain this object")
+
     return (
         f"You are a home navigation robot brain. Navigation goal: {goal}\n"
         + ctx_str
@@ -79,8 +102,9 @@ def _build_perceive_prompt(goal: str, n_waypoints: int = 0, context: dict = None
         + f"- target_visible=true: {goal} is visible ANYWHERE (background/doorway/corner counts)\n"
         + "- confidence: if visible 0.1-1.0 (partial/far=0.3-0.6, clear=0.8+), else 0.0\n"
         + "- room: room type you are currently in\n"
-        + f"- relevance: 0.0-1.0, how likely navigating this direction leads to {goal}\n"
-        + "  (living_room for sofa/chair=0.9, hallway=0.4, bedroom for sofa=0.1)\n"
+        + f"- relevance: 0.0-1.0, use ROOM COMMONSENSE — where is {goal} typically found?\n"
+        + f"  ({_room_hint})\n"
+        + f"  If you are in the WRONG room type for {goal}, relevance must be LOW (≤0.2).\n"
         + "- direction: where the target is (left/center/right), not_visible if absent\n"
         + waypoint_rule + skill_rules
     )

@@ -243,7 +243,19 @@ def verify_arrival(env, nav_state: dict) -> dict:
         if not vlm_confirmed:
             print(f"  [VERIFY step={step}] VLM vis=True but nearest instance xz={xz_inst:.2f}m > 1.5m → NOT confirmed", flush=True)
     else:
-        vlm_confirmed = target_visible and confidence >= 0.25 and dist <= 1.5
+        if not instances:
+            # No GT instances: depth estimate is unreliable.
+            # During 360° scan (scanned > 0), trust high-confidence VLM sighting directly
+            # (eval.py scores based on actual GT distance, so false positives → failure there).
+            # On initial entry (scanned=0), require very close approach to avoid immediate
+            # false positives before the robot has a chance to orient.
+            scanned = nav_state.get("verify_scanned", 0)
+            if scanned > 0:
+                vlm_confirmed = target_visible and confidence >= 0.80
+            else:
+                vlm_confirmed = target_visible and confidence >= 0.80 and dist <= 0.3
+        else:
+            vlm_confirmed = target_visible and confidence >= 0.25 and dist <= 1.5
 
     if vlm_confirmed:
         rx, rz = float(robot_pos[0]), float(robot_pos[2])
@@ -251,7 +263,7 @@ def verify_arrival(env, nav_state: dict) -> dict:
         print(f"  [VERIFY step={step}] SUCCESS dist_to_tgt={dist:.3f}m xz_inst={xz_inst:.3f}m vis={target_visible} conf={confidence:.2f} → DONE", flush=True)
         nav_state["done"]          = True
         nav_state["current_skill"] = "done"
-    elif dist <= ARRIVE_DIST and target_visible and confidence >= 0.25:
+    elif dist <= ARRIVE_DIST and target_visible and confidence >= 0.25 and instances:
         from agent.habitat_env import ACTION_FORWARD, ACTION_LEFT
         to_target = np.array(target_pos) - robot_pos
         forward = _get_forward(env)
@@ -276,7 +288,9 @@ def verify_arrival(env, nav_state: dict) -> dict:
                     for p in instances
                 )
             else:
-                xz_dist = dist  # fallback
+                # No GT: depth estimate is unreliable — don't auto-succeed on stagnation.
+                # Revert to explore so robot tries a different approach.
+                xz_dist = float("inf")
             if xz_dist <= 1.5:
                 print(f"  [VERIFY step={step}] STAGNANT dist3d={dist:.3f}m xz={xz_dist:.3f}m → SUCCESS", flush=True)
                 nav_state["done"]          = True
@@ -293,7 +307,17 @@ def verify_arrival(env, nav_state: dict) -> dict:
         nav_state["last_frame"]  = frame
         nav_state["step_count"] += 1
         nav_state["verify_scanned"] = 0
-    elif dist <= ARRIVE_DIST and not target_visible:
+    elif dist <= ARRIVE_DIST:
+        # Directional-snap waypoint reached (no GT instances, far target).
+        # This is just a steering point, not the actual target location.
+        # Revert to explore immediately so loop re-snaps toward target from new position.
+        if not instances and nav_state.get("directional_snap"):
+            print(f"  [VERIFY step={step}] directional waypoint reached → re-chase", flush=True)
+            nav_state["target_pos"]    = None
+            nav_state["current_skill"] = "explore_frontier"
+            nav_state["waypoints"]     = []
+            nav_state.pop("directional_snap", None)
+            return nav_state
         scanned = nav_state.get("verify_scanned", 0)
         if scanned < 24:
             from agent.habitat_env import ACTION_LEFT
@@ -315,7 +339,8 @@ def verify_arrival(env, nav_state: dict) -> dict:
                     for p in instances
                 )
             else:
-                xz_near = dist
+                # No GT: don't auto-succeed after 360° scan based on estimate distance.
+                xz_near = float("inf")
             if xz_near <= 1.5:
                 print(f"  [VERIFY step={step}] 360° scan, NOT found BUT xz={xz_near:.3f}m ≤ 1.5m → SUCCESS", flush=True)
                 nav_state["done"]          = True
@@ -331,4 +356,64 @@ def verify_arrival(env, nav_state: dict) -> dict:
         nav_state["current_skill"] = "follow_path"
         nav_state["verify_scanned"] = 0
 
+    return nav_state
+
+
+@skill("visual_servo")
+def visual_servo(env, nav_state):
+    """Reactive visual tracking: turn toward VLM-reported target direction.
+
+    Triggered when VLM sees target with high confidence (no GT instances).
+    Uses the most recent percept's direction field — no depth estimate needed.
+    Exits back to explore_frontier if target is lost for 3 consecutive steps,
+    or stops (lets eval judge) after 50 servo steps.
+    """
+    from agent.habitat_env import ACTION_FORWARD, ACTION_LEFT, ACTION_RIGHT
+
+    step     = nav_state.get("step_count", 0)
+    percept  = nav_state.get("last_percept", {})
+    direction  = percept.get("direction", "not_visible")
+    confidence = float(percept.get("confidence", 0.0))
+    vis        = percept.get("target_visible", False)
+
+    servo_steps = nav_state.get("servo_steps", 0)
+    servo_lost  = nav_state.get("servo_lost",  0)
+
+    if not vis or confidence < 0.3:
+        servo_lost += 1
+        nav_state["servo_lost"] = servo_lost
+        if servo_lost >= 3:
+            print(f"  [SERVO step={step}] target lost {servo_lost} steps → explore", flush=True)
+            nav_state["current_skill"]  = "explore_frontier"
+            nav_state["servo_steps"]    = 0
+            nav_state["servo_lost"]     = 0
+            nav_state["vis_consecutive"] = 0
+        else:
+            print(f"  [SERVO step={step}] lost ({servo_lost}/3) → turn to search", flush=True)
+            frame, _ = env.step(ACTION_LEFT)
+            nav_state["last_frame"]  = frame
+            nav_state["step_count"] += 1
+        return nav_state
+
+    nav_state["servo_lost"] = 0
+    servo_steps += 1
+    nav_state["servo_steps"] = servo_steps
+
+    if servo_steps >= 50:
+        print(f"  [SERVO step={step}] 50 steps reached → stop (eval will judge dist)", flush=True)
+        nav_state["done"]          = True
+        nav_state["current_skill"] = "done"
+        return nav_state
+
+    if direction == "left":
+        action, action_name = ACTION_LEFT, "LEFT"
+    elif direction == "right":
+        action, action_name = ACTION_RIGHT, "RIGHT"
+    else:
+        action, action_name = ACTION_FORWARD, "FWD"
+
+    print(f"  [SERVO step={step}] dir={direction} conf={confidence:.2f} → {action_name} (servo={servo_steps})", flush=True)
+    frame, _ = env.step(action)
+    nav_state["last_frame"]  = frame
+    nav_state["step_count"] += 1
     return nav_state
