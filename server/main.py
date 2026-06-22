@@ -24,6 +24,7 @@ import numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
+from PIL import Image
 from pydantic import BaseModel
 
 WEB_DIR    = Path(__file__).parent.parent / "web"
@@ -55,7 +56,10 @@ def _habitat_worker():
 
     FIXED_SPAWN = [-8.24, 0.163, -1.47]  # living room, good demo start
     env.reset(SCENE_DIR, start_pos=FIXED_SPAWN)
-    _frame_q.put(("frame", env.get_frame(), {"status": "idle"}))  # initial frame
+    _frame_q.put(("frame", env.get_frame(), {"status": "idle"}))
+    overhead = env.get_overhead_frame()
+    if overhead is not None:
+        _frame_q.put(("overhead", overhead, {"status": "idle"}))
 
     _explore_map = None  # preserved across tasks (grid + topo, value reset per task)
     _topo_map    = None
@@ -70,13 +74,23 @@ def _habitat_worker():
 
         try:
             def on_frame(frame, nav_state):
+                step = nav_state.get("step_count", 0)
                 state = {
                     "status": "navigating",
                     "goal":   nav_state.get("goal", goal),
-                    "step":   nav_state.get("step_count", 0),
+                    "step":   step,
                     "skill":  nav_state.get("current_skill", ""),
                 }
                 _frame_q.put(("frame", frame, state))
+
+                overhead = env.get_overhead_frame()
+                if overhead is not None:
+                    _frame_q.put(("overhead", overhead, state))
+
+                if step % 10 == 0 and _explore_map is not None:
+                    robot_pose = env.get_robot_pose()
+                    map_png = _map_to_png(_explore_map, robot_pose)
+                    _frame_q.put(("map", map_png, state))
 
             def on_thought(step, skill, reason):
                 _frame_q.put(("thought", None, {
@@ -126,6 +140,12 @@ async def _frame_broadcaster():
                 "img":  base64.b64encode(jpeg).decode(),
                 **state,
             }
+        elif kind == "overhead":
+            jpeg    = _frame_to_jpeg(frame)
+            payload = {"type": "overhead", "img": base64.b64encode(jpeg).decode(), **state}
+        elif kind == "map":
+            # frame is already PNG bytes here
+            payload = {"type": "map", "img": base64.b64encode(frame).decode(), **state}
         elif kind == "thought":
             payload = {"type": "thought", **state}
         else:
@@ -211,8 +231,60 @@ async def ws_endpoint(ws: WebSocket):
 # ── Utilities ──────────────────────────────────────────────────────────────────
 
 def _frame_to_jpeg(frame: np.ndarray) -> bytes:
-    from PIL import Image
     img = Image.fromarray(frame.astype(np.uint8))
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=80)
+    return buf.getvalue()
+
+
+def _map_to_png(explore_map, robot_pose) -> bytes:
+    """Render the ExploreMap as a top-down PNG (400×400).
+
+    Layers (bottom→top):
+      - black  = UNKNOWN cells
+      - gray   = EXPLORED cells
+      - plasma = VLM value heatmap (blue → green → red)
+      - cyan   = frontier cells
+      - red    = robot position
+    """
+    grid  = explore_map.grid   # (N, N) uint8
+    value = explore_map.value  # (N, N) float32
+    N = grid.shape[0]
+
+    rgb = np.zeros((N, N, 3), dtype=np.uint8)
+
+    # Explored area: dark gray
+    explored = grid == 1
+    rgb[explored] = [55, 55, 55]
+
+    # Heatmap overlay where value is non-trivial (pseudo-plasma: blue→green→red)
+    hot = (value > 0.01) & explored
+    if hot.any():
+        v = np.clip(value[hot], 0.0, 1.0)
+        r = np.clip((255 * (v * 2 - 0.5)), 0, 255).astype(np.uint8)
+        g = np.clip((255 * np.sin(np.pi * v)), 0, 255).astype(np.uint8)
+        b = np.clip((255 * (1.0 - v * 2)), 0, 255).astype(np.uint8)
+        rgb[hot, 0] = r
+        rgb[hot, 1] = g
+        rgb[hot, 2] = b
+
+    # Frontier cells: cyan
+    for fi, fj in explore_map.frontiers():
+        if 0 <= fi < N and 0 <= fj < N:
+            r0, r1 = max(0, fi - 1), min(N, fi + 2)
+            c0, c1 = max(0, fj - 1), min(N, fj + 2)
+            rgb[r0:r1, c0:c1] = [0, 200, 200]
+
+    # Robot position: red dot
+    pos, _heading = robot_pose
+    ri, rj = explore_map._w2g(pos[0], pos[2])
+    if 0 <= ri < N and 0 <= rj < N:
+        r0, r1 = max(0, ri - 3), min(N, ri + 4)
+        c0, c1 = max(0, rj - 3), min(N, rj + 4)
+        rgb[r0:r1, c0:c1] = [255, 70, 70]
+
+    # Flip vertically so world +Z points up on screen
+    img = Image.fromarray(np.flipud(rgb))
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
     return buf.getvalue()
