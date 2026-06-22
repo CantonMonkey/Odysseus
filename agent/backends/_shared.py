@@ -91,21 +91,34 @@ def _build_perceive_prompt(goal: str, n_waypoints: int = 0, context: dict = None
     }
     _room_hint = _ROOM_HINTS.get(goal, "use common sense about which rooms typically contain this object")
 
+    _ex_wp   = ',"waypoint":0'   if waypoint_field else ""
+    _ex_sk_y = ',"skill":"snap","reason":"target visible"'    if skill_field else ""
+    _ex_sk_n = ',"skill":"explore","reason":"not found"'      if skill_field else ""
+    _ex_vis  = (
+        '{"direction":"center","confidence":0.85,"room":"living_room","relevance":0.9'
+        + _ex_wp + _ex_sk_y + "}"
+    )
+    _ex_hid  = (
+        '{"direction":"not_visible","confidence":0.0,"room":"hallway","relevance":0.3'
+        + _ex_wp + _ex_sk_n + "}"
+    )
     return (
         f"You are a home navigation robot brain. Navigation goal: {goal}\n"
         + ctx_str
-        + "Observe the entire image carefully. Return ONE JSON line, no other text:\n"
-        + '{"target_visible":bool,"direction":"left|center|right|not_visible",'
-        + '"confidence":float,"room":"living_room|bedroom|hallway|kitchen|staircase|bathroom|other",'
+        + "Observe the entire image carefully. Return ONE JSON line, no other text.\n"
+        + "REQUIRED JSON:\n"
+        + '{"direction":"left|center|right|not_visible","confidence":float,'
+        + '"room":"living_room|bedroom|hallway|kitchen|staircase|bathroom|other",'
         + f'"relevance":float{waypoint_field}{skill_field}}}\n'
+        + f"EXAMPLE when {goal} visible: {_ex_vis}\n"
+        + f"EXAMPLE when {goal} not visible: {_ex_hid}\n"
         + "Rules:\n"
-        + f"- target_visible=true: {goal} is visible ANYWHERE (background/doorway/corner counts)\n"
-        + "- confidence: if visible 0.1-1.0 (partial/far=0.3-0.6, clear=0.8+), else 0.0\n"
+        + f"- direction: left|center|right if {goal} seems present in that area, not_visible if absent\n"
+        + "- confidence: 0.0-1.0 how sure you are about direction and room\n"
         + "- room: room type you are currently in\n"
         + f"- relevance: 0.0-1.0, use ROOM COMMONSENSE — where is {goal} typically found?\n"
         + f"  ({_room_hint})\n"
         + f"  If you are in the WRONG room type for {goal}, relevance must be LOW (≤0.2).\n"
-        + "- direction: where the target is (left/center/right), not_visible if absent\n"
         + waypoint_rule + skill_rules
     )
 
@@ -120,7 +133,9 @@ def _parse_percept_json(text: str, goal: str) -> dict:
     try:
         js, je = text.rfind("{"), text.rfind("}") + 1
         result = json.loads(text[js:je])
-        if not result.get("target_visible", False):
+        # Only zero-out confidence/direction when target_visible is EXPLICITLY false.
+        # If the field is absent (new schema without target_visible), preserve VLM signals.
+        if "target_visible" in result and not result["target_visible"]:
             result["confidence"] = 0.0
             result["direction"]  = "not_visible"
         return result

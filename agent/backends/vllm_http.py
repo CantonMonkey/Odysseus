@@ -29,7 +29,7 @@ class VLLMBackend:
                 {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
                 {"type": "text", "text": _build_perceive_prompt(goal, n_waypoints, context)},
             ]}],
-            "max_tokens": 128,
+            "max_tokens": 256,
             "temperature": 0.0,
         }
         try:

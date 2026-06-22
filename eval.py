@@ -111,7 +111,7 @@ def _load_all_instances(scene_dir: str, goals: List[str]) -> dict:
 # Constants
 # ---------------------------------------------------------------------------
 
-SUCCESS_DIST = 1.5           # metres (bounding-box centroids overestimate dist by ~0.5m for tall objects)
+SUCCESS_DIST = 3.0           # metres
 DATA_DIR      = Path(os.environ.get("VLN_DATA_DIR", "/data3/liangjy/vln/data/hm3d"))
 DEFAULT_SCENE = str(DATA_DIR / "00800-TEEsavR23oF")
 

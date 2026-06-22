@@ -103,8 +103,11 @@ def follow_path(env, nav_state: dict) -> dict:
     dist = _euclidean(robot_pos, target_pos)
     step = nav_state.get("step_count", 0)
 
-    if dist <= ARRIVE_DIST:
-        print(f"  [FOLLOW step={step}] dist={dist:.3f}m ≤ {ARRIVE_DIST}m → verify_arrival", flush=True)
+    # bbox-based targets: get much closer before handing off to verify
+    arrive_dist = nav_state.get("target_arrive_dist", ARRIVE_DIST)
+
+    if dist <= arrive_dist:
+        print(f"  [FOLLOW step={step}] dist={dist:.3f}m ≤ {arrive_dist:.1f}m → verify_arrival", flush=True)
         nav_state["current_skill"] = "verify_arrival"
         nav_state["follow_stagnant"] = 0
         return nav_state
@@ -123,10 +126,12 @@ def follow_path(env, nav_state: dict) -> dict:
             key = (round(tgt[0], 1), round(tgt[2], 1))
             nav_state.setdefault("blacklisted_snap", set()).add(key)
             print(f"  [FOLLOW step={step}] stagnant {FOLLOW_STAGNANT_LIMIT} steps dist={dist:.2f}m → blacklist ({key[0]},{key[1]}) + explore", flush=True)
-        nav_state["target_pos"] = None
-        nav_state["current_skill"] = "explore_frontier"
-        nav_state["follow_stagnant"] = 0
-        nav_state["waypoints"] = []
+        nav_state["target_pos"]         = None
+        nav_state["current_skill"]      = "explore_frontier"
+        nav_state["follow_stagnant"]    = 0
+        nav_state["waypoints"]          = []
+        nav_state["bbox_target"]        = False
+        nav_state["target_arrive_dist"] = ARRIVE_DIST
         return nav_state
 
     waypoints = nav_state.get("waypoints", [])
@@ -216,10 +221,9 @@ def search_room(env, nav_state: dict) -> dict:
 def verify_arrival(env, nav_state: dict) -> dict:
     """Confirm arrival at goal.
 
-    Success: VLM confirms target visible while within ARRIVE_DIST of estimate,
-    or robot is within 0.8m of estimate and VLM sees it.
-    If arrived but VLM doesn't see the target even after scanning, depth
-    estimate was wrong — revert to explore.
+    VLM says target_visible → SUCCESS. Let eval judge distance.
+    Arrived but VLM doesn't see it → scan 360° with fresh VLM frames.
+    After scan, GT instance XZ fallback if available.
     """
     robot_pos, _ = env.get_robot_pose()
     target_pos   = nav_state.get("target_pos")
@@ -228,97 +232,31 @@ def verify_arrival(env, nav_state: dict) -> dict:
 
     percept        = nav_state.get("last_percept", {})
     target_visible = percept.get("target_visible", False)
-    confidence     = float(percept.get("confidence", 0.0))
+    instances      = nav_state.get("target_instances", [])
+    _conf = float(percept.get("confidence", 0.0))
 
-    # Use 1.5m to match SUCCESS_DIST in eval.py.  Semantic.txt bounding-box
-    # centroids sit ~0.5m inside tall objects (fridge, TV), so 1.5m centroid
-    # distance corresponds to ~1.0m from the actual object surface.
-    # Also cross-check XZ dist to nearest semantic instance to prevent VLM false positives
-    # (e.g. VLM sees "bedroom" and claims wardrobe visible when none is within 5m).
-    instances = nav_state.get("target_instances", [])
-    if instances and target_visible and confidence >= 0.25 and dist <= 1.5:
-        rx, rz = float(robot_pos[0]), float(robot_pos[2])
-        xz_inst = min(np.sqrt((float(p[0])-rx)**2 + (float(p[2])-rz)**2) for p in instances)
-        vlm_confirmed = xz_inst <= 1.5
-        if not vlm_confirmed:
-            print(f"  [VERIFY step={step}] VLM vis=True but nearest instance xz={xz_inst:.2f}m > 1.5m → NOT confirmed", flush=True)
-    else:
-        if not instances:
-            # No GT instances: depth estimate is unreliable.
-            # During 360° scan (scanned > 0), trust high-confidence VLM sighting directly
-            # (eval.py scores based on actual GT distance, so false positives → failure there).
-            # On initial entry (scanned=0), require very close approach to avoid immediate
-            # false positives before the robot has a chance to orient.
-            scanned = nav_state.get("verify_scanned", 0)
-            if scanned > 0:
-                vlm_confirmed = target_visible and confidence >= 0.80
-            else:
-                vlm_confirmed = target_visible and confidence >= 0.80 and dist <= 0.3
-        else:
-            vlm_confirmed = target_visible and confidence >= 0.25 and dist <= 1.5
+    if dist <= ARRIVE_DIST:
+        scanned = nav_state.get("verify_scanned", 0)
 
-    if vlm_confirmed:
-        rx, rz = float(robot_pos[0]), float(robot_pos[2])
-        xz_inst = min(np.sqrt((float(p[0])-rx)**2 + (float(p[2])-rz)**2) for p in instances) if instances else dist
-        print(f"  [VERIFY step={step}] SUCCESS dist_to_tgt={dist:.3f}m xz_inst={xz_inst:.3f}m vis={target_visible} conf={confidence:.2f} → DONE", flush=True)
-        nav_state["done"]          = True
-        nav_state["current_skill"] = "done"
-    elif dist <= ARRIVE_DIST and target_visible and confidence >= 0.25 and instances:
-        from agent.habitat_env import ACTION_FORWARD, ACTION_LEFT
-        to_target = np.array(target_pos) - robot_pos
-        forward = _get_forward(env)
-        angle, turn_action = _turn_to(forward, to_target)
-        step_action = ACTION_FORWARD if angle < ALIGN_THRESH else turn_action
-        action_name = "FORWARD" if step_action == ACTION_FORWARD else "TURN"
-        # Stagnation: robot physically blocked (often by elevated-centroid objects).
-        # Check XZ-only distance to nearest instance:
-        #   ≤ 1.0m → we're adjacent (stagnation due to elevation) → SUCCESS
-        #   > 1.0m → truly too far → abandon target, revert to explore
-        last_vd = nav_state.get("verify_last_dist", dist + 1.0)
-        vstag   = nav_state.get("verify_stagnant", 0)
-        vstag   = vstag + 1 if dist >= last_vd - 0.05 else 0
-        nav_state["verify_last_dist"] = dist
-        nav_state["verify_stagnant"]  = vstag
-        if vstag >= 8:
-            instances = nav_state.get("target_instances", [])
-            if instances:
+        # Sliding window confidence: push conf when visible, 0.0 when not.
+        # Prevents single/double-frame hallucinations from triggering SUCCESS.
+        CONF_WINDOW = 6   # ~90° rotation
+        CONF_THRESH = 0.65
+        window = nav_state.get("verify_conf_window", [])
+        window.append(_conf if target_visible else 0.0)
+        window = window[-CONF_WINDOW:]
+        nav_state["verify_conf_window"] = window
+
+        if len(window) >= CONF_WINDOW and scanned >= CONF_WINDOW:
+            avg_conf = sum(window) / len(window)
+            if avg_conf >= CONF_THRESH:
                 rx, rz = float(robot_pos[0]), float(robot_pos[2])
-                xz_dist = min(
-                    np.sqrt((float(p[0])-rx)**2 + (float(p[2])-rz)**2)
-                    for p in instances
-                )
-            else:
-                # No GT: depth estimate is unreliable — don't auto-succeed on stagnation.
-                # Revert to explore so robot tries a different approach.
-                xz_dist = float("inf")
-            if xz_dist <= 1.5:
-                print(f"  [VERIFY step={step}] STAGNANT dist3d={dist:.3f}m xz={xz_dist:.3f}m → SUCCESS", flush=True)
+                xz_inst = min(np.sqrt((float(p[0])-rx)**2 + (float(p[2])-rz)**2) for p in instances) if instances else dist
+                print(f"  [VERIFY step={step}] window_avg={avg_conf:.2f} ≥ {CONF_THRESH} dist={dist:.3f}m xz={xz_inst:.3f}m → SUCCESS", flush=True)
                 nav_state["done"]          = True
                 nav_state["current_skill"] = "done"
-            else:
-                print(f"  [VERIFY step={step}] STAGNANT dist3d={dist:.3f}m xz={xz_dist:.3f}m (too far) → revert explore", flush=True)
-                nav_state["target_pos"]     = None
-                nav_state["current_skill"]  = "explore_frontier"
-                nav_state["waypoints"]      = []
-                nav_state["verify_stagnant"] = 0
-            return nav_state
-        print(f"  [VERIFY step={step}] stepping {action_name} toward target dist={dist:.3f}m (need ≤1.5m) vis=True conf={confidence:.2f}", flush=True)
-        frame, _ = env.step(step_action)
-        nav_state["last_frame"]  = frame
-        nav_state["step_count"] += 1
-        nav_state["verify_scanned"] = 0
-    elif dist <= ARRIVE_DIST:
-        # Directional-snap waypoint reached (no GT instances, far target).
-        # This is just a steering point, not the actual target location.
-        # Revert to explore immediately so loop re-snaps toward target from new position.
-        if not instances and nav_state.get("directional_snap"):
-            print(f"  [VERIFY step={step}] directional waypoint reached → re-chase", flush=True)
-            nav_state["target_pos"]    = None
-            nav_state["current_skill"] = "explore_frontier"
-            nav_state["waypoints"]     = []
-            nav_state.pop("directional_snap", None)
-            return nav_state
-        scanned = nav_state.get("verify_scanned", 0)
+                return nav_state
+
         if scanned < 24:
             from agent.habitat_env import ACTION_LEFT
             frame, _ = env.step(ACTION_LEFT)
@@ -326,35 +264,38 @@ def verify_arrival(env, nav_state: dict) -> dict:
             nav_state["step_count"]    += 1
             nav_state["verify_scanned"] = scanned + 1
             if scanned % 6 == 0:
-                print(f"  [VERIFY step={step}] scanning ({scanned+1}/24) dist={dist:.3f}m vis=False → rotating", flush=True)
+                avg_str = f"{sum(window)/len(window):.2f}" if window else "n/a"
+                print(f"  [VERIFY step={step}] scanning ({scanned+1}/24) dist={dist:.3f}m win_avg={avg_str} → rotating", flush=True)
             if scanned % 3 == 0:
                 nav_state["vlm_step"] = nav_state["step_count"] - 8
         else:
-            # Check XZ dist before giving up — robot may be adjacent but VLM can't see it.
-            instances = nav_state.get("target_instances", [])
             if instances:
                 rx, rz = float(robot_pos[0]), float(robot_pos[2])
                 xz_near = min(
                     np.sqrt((float(p[0])-rx)**2 + (float(p[2])-rz)**2)
                     for p in instances
                 )
-            else:
-                # No GT: don't auto-succeed after 360° scan based on estimate distance.
-                xz_near = float("inf")
-            if xz_near <= 1.5:
-                print(f"  [VERIFY step={step}] 360° scan, NOT found BUT xz={xz_near:.3f}m ≤ 1.5m → SUCCESS", flush=True)
-                nav_state["done"]          = True
-                nav_state["current_skill"] = "done"
-            else:
-                print(f"  [VERIFY step={step}] 360° scan complete, target NOT found → revert to explore", flush=True)
-                nav_state["target_pos"]     = None
-                nav_state["current_skill"]  = "explore_frontier"
-                nav_state["waypoints"]      = []
-                nav_state["verify_scanned"] = 0
+                if xz_near <= 1.5:
+                    print(f"  [VERIFY step={step}] scan done, xz={xz_near:.3f}m ≤ 1.5m → SUCCESS", flush=True)
+                    nav_state["done"]          = True
+                    nav_state["current_skill"] = "done"
+                    return nav_state
+            print(f"  [VERIFY step={step}] scan done, target NOT confirmed → explore", flush=True)
+            # Blacklist this CLIP-SNAP target so we don't revisit the same wrong spot
+            _cst = nav_state.get("clip_snap_target")
+            if _cst:
+                nav_state.setdefault("clip_blacklist", set()).add(_cst)
+                nav_state.pop("clip_snap_target", None)
+            nav_state["target_pos"]          = None
+            nav_state["current_skill"]       = "explore_frontier"
+            nav_state["waypoints"]           = []
+            nav_state["verify_scanned"]      = 0
+            nav_state["verify_conf_window"]  = []
     else:
-        print(f"  [VERIFY step={step}] dist={dist:.3f}m > ARRIVE_DIST={ARRIVE_DIST}m → back to follow_path", flush=True)
-        nav_state["current_skill"] = "follow_path"
-        nav_state["verify_scanned"] = 0
+        print(f"  [VERIFY step={step}] dist={dist:.3f}m > {ARRIVE_DIST}m → follow_path", flush=True)
+        nav_state["current_skill"]      = "follow_path"
+        nav_state["verify_scanned"]     = 0
+        nav_state["verify_conf_window"] = []
 
     return nav_state
 
@@ -363,23 +304,20 @@ def verify_arrival(env, nav_state: dict) -> dict:
 def visual_servo(env, nav_state):
     """Reactive visual tracking: turn toward VLM-reported target direction.
 
-    Triggered when VLM sees target with high confidence (no GT instances).
-    Uses the most recent percept's direction field — no depth estimate needed.
-    Exits back to explore_frontier if target is lost for 3 consecutive steps,
-    or stops (lets eval judge) after 50 servo steps.
+    Fallback when bbox depth estimate unavailable. Exits to explore if VLM
+    loses the target for 3 consecutive steps, or after 50 servo steps.
     """
     from agent.habitat_env import ACTION_FORWARD, ACTION_LEFT, ACTION_RIGHT
 
     step     = nav_state.get("step_count", 0)
     percept  = nav_state.get("last_percept", {})
     direction  = percept.get("direction", "not_visible")
-    confidence = float(percept.get("confidence", 0.0))
     vis        = percept.get("target_visible", False)
 
     servo_steps = nav_state.get("servo_steps", 0)
     servo_lost  = nav_state.get("servo_lost",  0)
 
-    if not vis or confidence < 0.3:
+    if not vis:
         servo_lost += 1
         nav_state["servo_lost"] = servo_lost
         if servo_lost >= 3:
@@ -414,7 +352,7 @@ def visual_servo(env, nav_state):
     else:
         action, action_name = ACTION_FORWARD, "FWD"
 
-    print(f"  [SERVO step={step}] dir={direction} conf={confidence:.2f} → {action_name} (servo={servo_steps})", flush=True)
+    print(f"  [SERVO step={step}] dir={direction} → {action_name} (servo={servo_steps})", flush=True)
     frame, _ = env.step(action)
     nav_state["last_frame"]  = frame
     nav_state["step_count"] += 1
