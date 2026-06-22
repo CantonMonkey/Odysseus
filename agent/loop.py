@@ -967,13 +967,16 @@ def run_task(
         explore_map.update(robot_pos, R, vlm_score, direction=_vmap_dir)
 
         # ── VLFM proximity stop ────────────────────────────────────────
-        # If CLIP is confident AND we're near the highest-value map cell, declare done.
-        # Guard: require step >= 50 so the robot leaves spawn before checking
-        # (otherwise the spawn cell has the highest value and fires immediately).
+        # Require BOTH CLIP signal AND VLM target_visible confirmation.
+        # CLIP 2-class softmax fires on ANY furniture (false positives when 10m
+        # from sofa). VLM actually reads the image for the specific object.
+        # Guard: require step >= 50 so the robot leaves spawn first.
+        _vlm_vis_vm = nav_state.get("last_percept", {}).get("target_visible", False)
         if (step >= 50
                 and not nav_state.get("done", False)
                 and nav_state.get("current_skill") not in ("verify_arrival", "done")
-                and _clip_sc_vm > 0.68):
+                and _clip_sc_vm > 0.65
+                and _vlm_vis_vm):
             _bvp = explore_map.best_value_pos(robot_pos)
             if _bvp is not None:
                 _bvd = float(np.sqrt(
