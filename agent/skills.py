@@ -238,21 +238,36 @@ def verify_arrival(env, nav_state: dict) -> dict:
     if dist <= ARRIVE_DIST:
         scanned = nav_state.get("verify_scanned", 0)
 
-        # Sliding window confidence: push conf when visible, 0.0 when not.
-        # Prevents single/double-frame hallucinations from triggering SUCCESS.
+        # Use CLIP score (every step) instead of VLM confidence (every 8 steps).
+        # During a 24-step 360° scan, VLM fires only 3 times so most entries
+        # would be 0.0 — CLIP gives a real signal at every rotation step.
+        _clip_v = nav_state.get("last_clip", {}).get("score", 0.0)
         CONF_WINDOW = 6   # ~90° rotation
-        CONF_THRESH = 0.65
+        CONF_THRESH = 0.72  # CLIP 2-class softmax; achievable near objects
         window = nav_state.get("verify_conf_window", [])
-        window.append(_conf if target_visible else 0.0)
+        window.append(_clip_v)
         window = window[-CONF_WINDOW:]
         nav_state["verify_conf_window"] = window
+
+        # Early exit: three consecutive high-CLIP frames → done, no need for full scan.
+        _vstreak = nav_state.get("verify_clip_streak", 0)
+        if _clip_v > 0.85:
+            _vstreak += 1
+        else:
+            _vstreak = 0
+        nav_state["verify_clip_streak"] = _vstreak
+        if _vstreak >= 3:
+            print(f"  [VERIFY step={step}] CLIP streak=3 score={_clip_v:.2f} → SUCCESS", flush=True)
+            nav_state["done"]          = True
+            nav_state["current_skill"] = "done"
+            return nav_state
 
         if len(window) >= CONF_WINDOW and scanned >= CONF_WINDOW:
             avg_conf = sum(window) / len(window)
             if avg_conf >= CONF_THRESH:
                 rx, rz = float(robot_pos[0]), float(robot_pos[2])
                 xz_inst = min(np.sqrt((float(p[0])-rx)**2 + (float(p[2])-rz)**2) for p in instances) if instances else dist
-                print(f"  [VERIFY step={step}] window_avg={avg_conf:.2f} ≥ {CONF_THRESH} dist={dist:.3f}m xz={xz_inst:.3f}m → SUCCESS", flush=True)
+                print(f"  [VERIFY step={step}] CLIP_avg={avg_conf:.2f} ≥ {CONF_THRESH} dist={dist:.3f}m → SUCCESS", flush=True)
                 nav_state["done"]          = True
                 nav_state["current_skill"] = "done"
                 return nav_state

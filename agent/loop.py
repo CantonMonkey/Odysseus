@@ -653,9 +653,10 @@ def run_task(
                                 tgt = None
                                 nav_state["stagnant_steps"] = nav_state.get("stagnant_steps", 0) + 20
                         else:
-                            # No GT instances: try CLIP bbox first, then direction-based fallback.
-                            # CLIP bbox (from CLIP-MERGE or last_clip) is more precise than
-                            # the direction strip; direction-based is the last resort.
+                            # No GT instances: try CLIP bbox depth only.
+                            # Direction-based 5m guess is disabled — it's less accurate
+                            # than the value-map frontier and causes the robot to waste
+                            # 100-400 steps navigating to empty space.
                             _bbox_s = (percept.get("bbox")
                                        or nav_state.get("last_clip", {}).get("bbox"))
                             _btgt_s = _estimate_pos_from_bbox(
@@ -667,12 +668,9 @@ def run_task(
                                 _log(f"  [SNAP step={step}] no instances → bbox depth "
                                      f"({tgt[0]:.2f},{tgt[2]:.2f}) d={float(np.linalg.norm(tgt-robot_pos)):.1f}m")
                             else:
-                                # tgt still holds direction-based estimate from _estimate_target_pos
-                                if tgt is not None:
-                                    _log(f"  [SNAP step={step}] no instances, no bbox → dir-based "
-                                         f"({tgt[0]:.2f},{tgt[2]:.2f}) d={float(np.linalg.norm(tgt-robot_pos)):.1f}m")
-                                else:
-                                    _log(f"  [SNAP step={step}] no instances + no depth → skip")
+                                # No real 3D signal — let value-map frontier drive navigation.
+                                tgt = None
+                                _log(f"  [SNAP step={step}] no instances, no bbox → frontier-only (rel={rel:.2f})")
 
                         if tgt is not None:
                             old_skill = nav_state.get("current_skill")
@@ -953,8 +951,34 @@ def run_task(
         if _prior is not None:
             # Blend: 70% room prior + 30% VLM relevance (retains some per-frame signal)
             vlm_score = 0.7 * _prior + 0.3 * vlm_score
-        _log(f"  [VMAP step={step}] room={_vmap_room} prior={_prior} raw={_raw_score:.2f} → score={vlm_score:.2f} dir={_vmap_dir}")
+        # CLIP override: use live per-step score when object is visible.
+        # This is the core of VLFM — dense value-map update from image-text
+        # similarity at every step, not sparse 8-step VLM relevance.
+        _clip_r_vm   = nav_state.get("last_clip", {})
+        _clip_vis_vm = _clip_r_vm.get("visible", False)
+        _clip_sc_vm  = float(_clip_r_vm.get("score", 0.0))
+        _clip_dir_vm = _clip_r_vm.get("direction", "center")
+        if _clip_vis_vm and _clip_sc_vm > 0.55:
+            vlm_score = _clip_sc_vm
+            _vmap_dir = _clip_dir_vm
+            _log(f"  [VMAP step={step}] CLIP-driven score={vlm_score:.2f} dir={_vmap_dir}")
+        else:
+            _log(f"  [VMAP step={step}] room={_vmap_room} prior={_prior} raw={_raw_score:.2f} → score={vlm_score:.2f} dir={_vmap_dir}")
         explore_map.update(robot_pos, R, vlm_score, direction=_vmap_dir)
+
+        # ── VLFM proximity stop ────────────────────────────────────────
+        # If CLIP is confident AND we're near the highest-value map cell, declare done.
+        # Replicates VLFM's pure-proximity stopping — no sliding window needed.
+        if (not nav_state.get("done", False)
+                and nav_state.get("current_skill") not in ("verify_arrival", "done")
+                and _clip_sc_vm > 0.75):
+            _bvp = explore_map.best_value_pos(robot_pos)
+            if _bvp is not None:
+                _bvd = float(np.sqrt(
+                    (robot_pos[0] - _bvp[0])**2 + (robot_pos[2] - _bvp[2])**2))
+                if _bvd < 1.5:
+                    _log(f"  [VALUE-STOP step={step}] dist_to_best_cell={_bvd:.2f}m CLIP={_clip_sc_vm:.2f} → done")
+                    nav_state["done"] = True
 
         # ── Stagnation / ESCAPE ────────────────────────────────────────
         if current_skill == "explore_frontier":
