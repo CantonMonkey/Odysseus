@@ -968,10 +968,12 @@ def run_task(
 
         # ── VLFM proximity stop ────────────────────────────────────────
         # If CLIP is confident AND we're near the highest-value map cell, declare done.
-        # Replicates VLFM's pure-proximity stopping — no sliding window needed.
-        if (not nav_state.get("done", False)
+        # Guard: require step >= 50 so the robot leaves spawn before checking
+        # (otherwise the spawn cell has the highest value and fires immediately).
+        if (step >= 50
+                and not nav_state.get("done", False)
                 and nav_state.get("current_skill") not in ("verify_arrival", "done")
-                and _clip_sc_vm > 0.75):
+                and _clip_sc_vm > 0.68):
             _bvp = explore_map.best_value_pos(robot_pos)
             if _bvp is not None:
                 _bvd = float(np.sqrt(
