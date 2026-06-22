@@ -53,57 +53,28 @@ from agent.semantic_map import CHINESE_TO_CATEGORY, IGNORE_CATEGORIES
 # Instance discovery (evaluation only — uses Habitat's semantic scene)
 # ---------------------------------------------------------------------------
 
-def _load_all_instances(scene_dir: str, goals: List[str]) -> dict:
-    """Load GT instance positions for all goals using a temporary sim with the
-    annotated dataset config (which provides semantic_scene.objects in correct
-    Habitat world coordinates).
+def _load_all_instances(scene_dir: str, goals: List[str],
+                        floor_y_max: float = 1.5) -> dict:
+    """Load GT instance positions for all goals.
 
-    The temporary sim is closed before HabitatEnv is created to avoid double
-    GPU allocation.  Falls back to semantic_map.query_target() if the annotated
-    config file is not present.
+    Uses the trimesh-based semantic_map (reads from semantic_cache.json or
+    parses <scene>.semantic.glb directly).  Filters to ground-floor instances
+    only (|Y| < floor_y_max) so that second-floor objects don't count as
+    reachable targets for ground-floor spawns.
+
+    The Habitat semantic_scene approach returns [0,0,0] for all objects on
+    this setup (dataset-config coordinate mismatch), so we use trimesh instead.
     """
-    from pathlib import Path as _Path
     from agent.semantic_map import query_target
 
-    scene_dir_p = _Path(scene_dir)
-    scene_id    = scene_dir_p.name.split("-", 1)[1]
-    scene_glb   = str(scene_dir_p / f"{scene_id}.basis.glb")
-    dataset_cfg = str(scene_dir_p.parent / "hm3d_annotated_basis.scene_dataset_config.json")
-
     result: dict = {}
-
-    if _Path(dataset_cfg).exists():
-        cfg = habitat_sim.SimulatorConfiguration()
-        cfg.scene_id = scene_glb
-        cfg.scene_dataset_config_file = dataset_cfg
-        agent_cfg = habitat_sim.agent.AgentConfiguration()
-        agent_cfg.sensor_specifications = []
-        _sim = habitat_sim.Simulator(habitat_sim.Configuration(cfg, [agent_cfg]))
-        try:
-            for goal in goals:
-                keywords = CHINESE_TO_CATEGORY.get(goal, [goal.lower()])
-                positions, seen = [], set()
-                for obj in _sim.semantic_scene.objects:
-                    if obj is None or obj.category is None:
-                        continue
-                    name = obj.category.name().lower()
-                    if any(k in name for k in keywords) and name not in IGNORE_CATEGORIES:
-                        c = obj.aabb.center
-                        key = (round(float(c[0]), 1), round(float(c[2]), 1))
-                        if key not in seen:
-                            seen.add(key)
-                            positions.append(np.array(
-                                [float(c[0]), float(c[1]), float(c[2])], dtype=np.float32))
-                result[goal] = positions
-                print(f"  [semantic_scene] '{goal}': {len(positions)} instance(s)")
-        finally:
-            _sim.close()
-    else:
-        print(f"  [warn] annotated dataset config not found — using semantic_map fallback")
-        for goal in goals:
-            result[goal] = [np.asarray(p, dtype=np.float32)
-                            for p in query_target(scene_dir, goal)]
-
+    for goal in goals:
+        all_pos = [np.asarray(p, dtype=np.float32)
+                   for p in query_target(scene_dir, goal)]
+        ground = [p for p in all_pos if abs(float(p[1])) < floor_y_max]
+        result[goal] = ground
+        print(f"  [semantic_map] '{goal}': {len(ground)}/{len(all_pos)} "
+              f"ground-floor instance(s)")
     return result
 
 
