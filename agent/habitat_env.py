@@ -31,7 +31,6 @@ os.environ.setdefault("DISPLAY", "")
 
 import habitat_sim
 from habitat_sim import SensorType
-from habitat_sim.utils.common import quat_from_angle_axis
 
 # Action name constants
 ACTION_FORWARD = "move_forward"
@@ -114,8 +113,8 @@ def _make_config(
     overhead_spec.sensor_type = SensorType.COLOR
     overhead_spec.resolution  = [320, 320]
     overhead_spec.position    = [0.0, 4.0, 0.0]  # 4 m above agent origin
-    # Pitch -90° so the sensor looks straight down
-    overhead_spec.orientation = quat_from_angle_axis(-np.pi / 2, np.array([1.0, 0.0, 0.0]))
+    # orientation is Euler XYZ in radians; pitch -90° looks straight down
+    overhead_spec.orientation = np.array([-np.pi / 2, 0.0, 0.0])
 
     agent_cfg = habitat_sim.agent.AgentConfiguration()
     agent_cfg.height = rc["agent_height"]
