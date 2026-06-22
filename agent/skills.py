@@ -243,7 +243,7 @@ def verify_arrival(env, nav_state: dict) -> dict:
         # would be 0.0 — CLIP gives a real signal at every rotation step.
         _clip_v = nav_state.get("last_clip", {}).get("score", 0.0)
         CONF_WINDOW = 6   # ~90° rotation
-        CONF_THRESH = 0.72  # CLIP 2-class softmax; achievable near objects
+        CONF_THRESH = 0.45  # cosim-rescaled: 0.45 ≈ raw cosim 0.24 (clear target)
         window = nav_state.get("verify_conf_window", [])
         window.append(_clip_v)
         window = window[-CONF_WINDOW:]
@@ -251,7 +251,7 @@ def verify_arrival(env, nav_state: dict) -> dict:
 
         # Early exit: three consecutive high-CLIP frames → done, no need for full scan.
         _vstreak = nav_state.get("verify_clip_streak", 0)
-        if _clip_v > 0.85:
+        if _clip_v > 0.65:  # cosim-rescaled ≈ raw cosim 0.28 (strong target signal)
             _vstreak += 1
         else:
             _vstreak = 0

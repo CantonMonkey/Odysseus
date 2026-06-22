@@ -54,27 +54,50 @@ from agent.semantic_map import CHINESE_TO_CATEGORY, IGNORE_CATEGORIES
 # ---------------------------------------------------------------------------
 
 def _load_all_instances(scene_dir: str, goals: List[str],
-                        floor_y_max: float = 1.5) -> dict:
-    """Load GT instance positions for all goals.
+                        snap_threshold: float = 2.0) -> dict:
+    """Load GT instance positions for all goals using navmesh snapping.
 
-    Uses the trimesh-based semantic_map (reads from semantic_cache.json or
-    parses <scene>.semantic.glb directly).  Filters to ground-floor instances
-    only (|Y| < floor_y_max) so that second-floor objects don't count as
-    reachable targets for ground-floor spawns.
+    Parses 3D vertex positions from <scene>.semantic.glb via trimesh
+    (cached in semantic_cache.json), then snaps each position to the Habitat
+    navmesh.  Positions that don't snap within snap_threshold metres are
+    unreachable (second floor, ceiling, wall) and are discarded.
 
-    The Habitat semantic_scene approach returns [0,0,0] for all objects on
-    this setup (dataset-config coordinate mismatch), so we use trimesh instead.
+    Using navmesh snapping rather than a raw Y-threshold handles coordinate
+    mismatches between the semantic GLB frame and Habitat world, and naturally
+    excludes objects on floors the agent can't reach.
     """
     from agent.semantic_map import query_target
 
-    result: dict = {}
-    for goal in goals:
-        all_pos = [np.asarray(p, dtype=np.float32)
+    scene_dir_p = Path(scene_dir)
+    scene_id    = scene_dir_p.name.split("-", 1)[1]
+    scene_glb   = str(scene_dir_p / f"{scene_id}.basis.glb")
+
+    # Temporary sim just to access the navmesh pathfinder.
+    _sim_cfg              = habitat_sim.SimulatorConfiguration()
+    _sim_cfg.scene_id     = scene_glb
+    _a_cfg                = habitat_sim.agent.AgentConfiguration()
+    _a_cfg.sensor_specifications = []
+    _tmp_sim = habitat_sim.Simulator(habitat_sim.Configuration(_sim_cfg, [_a_cfg]))
+    pf       = _tmp_sim.pathfinder
+
+    try:
+        result: dict = {}
+        for goal in goals:
+            raw = [np.asarray(p, dtype=np.float32)
                    for p in query_target(scene_dir, goal)]
-        ground = [p for p in all_pos if abs(float(p[1])) < floor_y_max]
-        result[goal] = ground
-        print(f"  [semantic_map] '{goal}': {len(ground)}/{len(all_pos)} "
-              f"ground-floor instance(s)")
+            snapped = []
+            for p in raw:
+                sp = pf.snap_point(p)
+                if not np.isnan(sp).any():
+                    d = float(np.linalg.norm(sp - p))
+                    if d < snap_threshold:
+                        snapped.append(sp)
+            result[goal] = snapped
+            print(f"  [semantic_map] '{goal}': {len(snapped)}/{len(raw)} "
+                  f"navmesh-reachable instance(s) (snap_thr={snap_threshold}m)")
+    finally:
+        _tmp_sim.close()
+
     return result
 
 

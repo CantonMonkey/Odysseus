@@ -958,7 +958,9 @@ def run_task(
         _clip_vis_vm = _clip_r_vm.get("visible", False)
         _clip_sc_vm  = float(_clip_r_vm.get("score", 0.0))
         _clip_dir_vm = _clip_r_vm.get("direction", "center")
-        if _clip_vis_vm and _clip_sc_vm > 0.55:
+        # With raw cosim rescaling (Fix B), visible=True already means cosim>0.40
+        # (threshold in detect()). Extra 0.30 guard ensures meaningful signal.
+        if _clip_vis_vm and _clip_sc_vm > 0.30:
             vlm_score = _clip_sc_vm
             _vmap_dir = _clip_dir_vm
             _log(f"  [VMAP step={step}] CLIP-driven score={vlm_score:.2f} dir={_vmap_dir}")
@@ -968,14 +970,13 @@ def run_task(
 
         # ── VLFM proximity stop ────────────────────────────────────────
         # Require BOTH CLIP signal AND VLM target_visible confirmation.
-        # CLIP 2-class softmax fires on ANY furniture (false positives when 10m
-        # from sofa). VLM actually reads the image for the specific object.
+        # With cosim rescaling, 0.50 ≈ raw cosim 0.25 (genuine target match).
         # Guard: require step >= 50 so the robot leaves spawn first.
         _vlm_vis_vm = nav_state.get("last_percept", {}).get("target_visible", False)
         if (step >= 50
                 and not nav_state.get("done", False)
                 and nav_state.get("current_skill") not in ("verify_arrival", "done")
-                and _clip_sc_vm > 0.65
+                and _clip_sc_vm > 0.50
                 and _vlm_vis_vm):
             _bvp = explore_map.best_value_pos(robot_pos)
             if _bvp is not None:

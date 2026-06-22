@@ -48,20 +48,31 @@ class CLIPDetector:
             print(f"[CLIP] ready ({cls._device})", flush=True)
         return cls._model, cls._processor, cls._device
 
+    # Raw cosim rescaling constants (VLFM-style).
+    # CLIP ViT-B/32 cosim range: ~0.14 (background) to ~0.35 (clear target match).
+    # Rescale so that 0.14→0 and 0.36→1: score = clip((cosim - COSIM_LO) / COSIM_RANGE, 0, 1)
+    _COSIM_LO    = 0.14
+    _COSIM_RANGE = 0.22   # 0.14 + 0.22 = 0.36 maps to 1.0
+
     @classmethod
     def detect(cls, frame_rgb: np.ndarray, goal_zh: str,
-               threshold: float = 0.55) -> dict:
+               threshold: float = 0.40) -> dict:
         """
         Args:
             frame_rgb : H×W×3 uint8
             goal_zh   : Chinese goal string
-            threshold : 2-class softmax probability threshold for visibility
+            threshold : rescaled-cosim threshold for visibility (0-1 scale)
 
         Returns dict:
             visible   : bool
-            score     : float  (0-1)
+            score     : float  (0-1, rescaled cosine similarity)
             bbox      : [x1,y1,x2,y2] pixel coords, or None
             direction : "left"|"center"|"right"|"not_visible"
+
+        Uses VLFM-style raw cosine similarity between L2-normalized CLIP
+        image and text embeddings with template "Seems like there is a X ahead."
+        This is more discriminative than 2-class softmax, which fires on ANY
+        furniture (0.69-0.86 even when target is absent).
         """
         model, processor, device = cls._load()
         goal_en = _ZH_EN.get(goal_zh, goal_zh)
@@ -70,13 +81,15 @@ class CLIPDetector:
         from PIL import Image
         img = Image.fromarray(frame_rgb.astype(np.uint8))
 
-        # ── Step 1: full-image binary classification ──────────────────────
-        texts = [f"a {goal_en} in a room", "an empty room with no furniture"]
-        inp   = processor(text=texts, images=img, return_tensors="pt", padding=True)
+        # ── Step 1: full-image raw cosine similarity (VLFM-style) ─────────
+        text  = f"Seems like there is a {goal_en} ahead."
+        inp   = processor(text=[text], images=img, return_tensors="pt", padding=True)
         inp   = {k: v.to(device) for k, v in inp.items()}
         with torch.no_grad():
-            logits = model(**inp).logits_per_image[0]
-            score  = float(logits.softmax(dim=0)[0])
+            out      = model(**inp)
+            # image_embeds and text_embeds are L2-normalized in HuggingFace CLIP
+            cosim    = float((out.image_embeds * out.text_embeds).sum())
+        score = float(np.clip((cosim - cls._COSIM_LO) / cls._COSIM_RANGE, 0.0, 1.0))
 
         if score < threshold:
             return {"visible": False, "score": score,
