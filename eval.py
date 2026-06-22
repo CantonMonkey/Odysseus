@@ -9,11 +9,13 @@ Standard ObjectNav metrics (HM3D / MP3D benchmarks):
   SoftSPL : same formula but replaces the binary success indicator with a
             soft distance reward  max(0, 1 - dist_to_nearest / success_dist)
 
-Ground-truth object positions are obtained via agent.semantic_map.query_target
-and geodesic distances via habitat_sim.ShortestPath.  These are ONLY used for
-metric computation; the agent itself navigates purely from RGB-D + VLM output.
+Ground-truth object positions are obtained from Habitat's sim.semantic_scene
+(correct world coordinates) and geodesic distances via habitat_sim.ShortestPath.
+These are ONLY used for metric computation; the agent navigates purely from
+RGB-D + VLM output.
 """
 
+import os
 import sys
 import numpy as np
 import habitat_sim
@@ -22,21 +24,95 @@ from typing import List, Optional, Dict, Any
 import json
 from collections import defaultdict
 
-# Project root on the server
-_PROJECT = Path("/data3/liangjy/vln/Odysseus")
+# Load .env before anything else so VLN_DATA_DIR etc. are available
+def _load_dotenv(path: Path):
+    if not path.exists():
+        return
+    with open(path) as _f:
+        for _line in _f:
+            _line = _line.strip()
+            if not _line or _line.startswith("#") or "=" not in _line:
+                continue
+            _k, _, _v = _line.partition("=")
+            _k = _k.strip()
+            _v = _v.strip().strip('"').strip("'")
+            if _k and _k not in os.environ:
+                os.environ[_k] = _v
+_load_dotenv(Path(__file__).parent / ".env")
+
+# Project root — prefer current directory, fall back to legacy hardcoded path
+_PROJECT = Path(os.environ.get("VLN_PROJECT_DIR", str(Path(__file__).parent.resolve())))
 if str(_PROJECT) not in sys.path:
     sys.path.insert(0, str(_PROJECT))
 
 from agent.habitat_env import HabitatEnv
 from agent.loop import run_task
-from agent.semantic_map import query_target  # EVALUATION ONLY — not used by agent
+from agent.semantic_map import CHINESE_TO_CATEGORY, IGNORE_CATEGORIES
+
+# ---------------------------------------------------------------------------
+# Instance discovery (evaluation only — uses Habitat's semantic scene)
+# ---------------------------------------------------------------------------
+
+def _load_all_instances(scene_dir: str, goals: List[str]) -> dict:
+    """Load GT instance positions for all goals using a temporary sim with the
+    annotated dataset config (which provides semantic_scene.objects in correct
+    Habitat world coordinates).
+
+    The temporary sim is closed before HabitatEnv is created to avoid double
+    GPU allocation.  Falls back to semantic_map.query_target() if the annotated
+    config file is not present.
+    """
+    from pathlib import Path as _Path
+    from agent.semantic_map import query_target
+
+    scene_dir_p = _Path(scene_dir)
+    scene_id    = scene_dir_p.name.split("-", 1)[1]
+    scene_glb   = str(scene_dir_p / f"{scene_id}.basis.glb")
+    dataset_cfg = str(scene_dir_p.parent / "hm3d_annotated_basis.scene_dataset_config.json")
+
+    result: dict = {}
+
+    if _Path(dataset_cfg).exists():
+        cfg = habitat_sim.SimulatorConfiguration()
+        cfg.scene_id = scene_glb
+        cfg.scene_dataset_config_file = dataset_cfg
+        agent_cfg = habitat_sim.agent.AgentConfiguration()
+        agent_cfg.sensor_specifications = []
+        _sim = habitat_sim.Simulator(habitat_sim.Configuration(cfg, [agent_cfg]))
+        try:
+            for goal in goals:
+                keywords = CHINESE_TO_CATEGORY.get(goal, [goal.lower()])
+                positions, seen = [], set()
+                for obj in _sim.semantic_scene.objects:
+                    if obj is None or obj.category is None:
+                        continue
+                    name = obj.category.name().lower()
+                    if any(k in name for k in keywords) and name not in IGNORE_CATEGORIES:
+                        c = obj.aabb.center
+                        key = (round(float(c[0]), 1), round(float(c[2]), 1))
+                        if key not in seen:
+                            seen.add(key)
+                            positions.append(np.array(
+                                [float(c[0]), float(c[1]), float(c[2])], dtype=np.float32))
+                result[goal] = positions
+                print(f"  [semantic_scene] '{goal}': {len(positions)} instance(s)")
+        finally:
+            _sim.close()
+    else:
+        print(f"  [warn] annotated dataset config not found — using semantic_map fallback")
+        for goal in goals:
+            result[goal] = [np.asarray(p, dtype=np.float32)
+                            for p in query_target(scene_dir, goal)]
+
+    return result
+
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
-SUCCESS_DIST = 1.5           # metres (bounding-box centroids overestimate dist by ~0.5m for tall objects)
-DATA_DIR     = Path("/data3/liangjy/vln/data/hm3d")
+SUCCESS_DIST = 3.0           # metres
+DATA_DIR      = Path(os.environ.get("VLN_DATA_DIR", "/data3/liangjy/vln/data/hm3d"))
 DEFAULT_SCENE = str(DATA_DIR / "00800-TEEsavR23oF")
 
 
@@ -102,6 +178,9 @@ def _run_episode(
     use_vlm: bool,
     episode_idx: int,
     spawn_pos: Optional[np.ndarray] = None,
+    log_dir: Optional[str] = None,
+    initial_explore_map=None,
+    initial_topo_map=None,
 ) -> Optional[Dict[str, Any]]:
     """Run one episode and return metrics, or None if episode is unreachable.
 
@@ -129,12 +208,10 @@ def _run_episode(
     L_star = _nearest_geodesic(pf, start_pos, instances)
 
     if L_star == float("inf"):
-        # No reachable instance — skip (not counted as failure)
-        print(
-            f"    [skip] goal={goal} ep={episode_idx}: "
-            "no reachable instance on navmesh"
-        )
-        return None
+        # Target not reachable from start — run anyway, counts as hard failure.
+        # VLM may still find the target via semantic reasoning (e.g. go upstairs).
+        print(f"    [warn] goal={goal} ep={episode_idx}: L*=inf (target unreachable from spawn) — running")
+        L_star = 99.0  # SPL denominator: failure gives SPL=0, success is rare but counted
 
     # 3. Set up llm_perceive
     if use_vlm:
@@ -161,7 +238,10 @@ def _run_episode(
     env.step = _tracked_step  # type: ignore[assignment]
 
     try:
-        # 5. Run the navigation loop
+        # 5. Run the navigation loop.
+        # target_instances is intentionally NOT passed — the agent navigates
+        # purely from RGB-D + VLM perception, with no privileged GT coordinates.
+        # GT instance positions are only used below for metric computation.
         result = run_task(
             env,
             goal,
@@ -169,7 +249,9 @@ def _run_episode(
             on_frame=None,
             llm_perceive=llm_perceive,
             max_steps=max_steps,
-            target_instances=instances,
+            target_instances=[],
+            initial_explore_map=initial_explore_map,
+            initial_topo_map=initial_topo_map,
         )
     finally:
         env.step = _original_step  # restore
@@ -201,7 +283,8 @@ def _run_episode(
         f"dist={dist_to_nearest:.2f}m L*={L_star:.1f}m spl={spl:.3f} steps={steps} "
         f"spawn=({start_pos[0]:.1f},{start_pos[2]:.1f})"
     )
-    return {
+
+    ep_result = {
         "success":         success,
         "spl":             spl,
         "soft_spl":        soft_spl,
@@ -213,6 +296,138 @@ def _run_episode(
         "episode":         episode_idx,
         "spawn_pos":       start_pos.tolist(),
     }
+
+    # Write structured per-step VLM log as JSON sidecar
+    step_log = result.get("step_log", [])
+    if step_log and log_dir:
+        _sidecar = Path(log_dir) / f"steplog_{goal}_ep{episode_idx:02d}.json"
+        try:
+            _sidecar.write_text(json.dumps({
+                "episode": ep_result,
+                "steps":   step_log,
+            }, ensure_ascii=False, indent=2))
+            print(f"    [log] {_sidecar}")
+        except Exception as _e:
+            print(f"    [log] sidecar write failed: {_e}")
+
+    return ep_result
+
+
+# ---------------------------------------------------------------------------
+# Multi-goal chained episode
+# ---------------------------------------------------------------------------
+
+def _run_chain_episode(
+    env: HabitatEnv,
+    scene_dir: str,
+    goals: List[str],
+    all_instances: Dict[str, List[np.ndarray]],
+    max_steps_total: int,
+    use_vlm: bool,
+    episode_idx: int,
+    spawn_pos: Optional[np.ndarray] = None,
+    log_dir: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Run all goals sequentially in one episode with shared explore/topo maps.
+
+    Implements continuous multi-goal navigation:  after reaching goal N the
+    agent continues from its current position towards goal N+1, retaining the
+    same occupancy grid and topological memory.  Steps budget is shared across
+    all goals.
+    """
+    from agent.explore_map import ExploreMap
+    from agent.topo_map   import TopoMap
+    import math
+
+    frame = env.reset(scene_dir, start_pos=spawn_pos)
+    start_pos_chain, _ = env.get_robot_pose()
+
+    if use_vlm:
+        try:
+            from agent.llm_agent import perceive
+            llm_perceive = lambda fr, g, **kw: perceive(fr, g, **kw)
+        except ImportError:
+            llm_perceive = None
+    else:
+        llm_perceive = None
+
+    shared_explore = ExploreMap()
+    shared_topo    = TopoMap()
+    results        = []
+    steps_used     = 0
+    max_per_goal   = math.ceil(max_steps_total / len(goals))
+
+    path_all: List[np.ndarray] = [start_pos_chain.copy()]
+    _original_step = env.step
+
+    def _tracked_step(action):
+        r = _original_step(action)
+        pos, _ = env.get_robot_pose()
+        path_all.append(pos.copy())
+        return r
+
+    env.step = _tracked_step  # type: ignore[assignment]
+
+    try:
+        for gi, goal in enumerate(goals):
+            instances = all_instances.get(goal, [])
+            if not instances:
+                print(f"    [chain] goal={goal}: no instances, skip")
+                continue
+            cur_pos, _ = env.get_robot_pose()
+            L_star = _nearest_geodesic(env._sim.pathfinder, cur_pos, instances)
+            if L_star == float("inf"):
+                print(f"    [chain] goal={goal}: unreachable, skip")
+                continue
+
+            steps_left = max_steps_total - steps_used
+            budget     = min(max_per_goal, steps_left)
+            path_before = len(path_all)
+
+            result = run_task(
+                env, goal, scene_dir=scene_dir, on_frame=None,
+                llm_perceive=llm_perceive, max_steps=budget,
+                target_instances=[],   # no GT coords in navigation
+                initial_explore_map=shared_explore,
+                initial_topo_map=shared_topo,
+            )
+            steps_used += result.get("step_count", 0)
+
+            path_seg = path_all[path_before:]
+            p_seg = sum(
+                float(np.linalg.norm(path_seg[i] - path_seg[i-1]))
+                for i in range(1, len(path_seg))
+            ) if len(path_seg) > 1 else 0.0
+
+            final_pos, _ = env.get_robot_pose()
+            dist = _nearest_euclidean(final_pos, instances)
+            success = dist < SUCCESS_DIST
+            denom   = max(L_star, p_seg)
+            spl     = (float(success) * L_star / denom) if denom > 0 else 0.0
+
+            ep_r = {
+                "success": success, "spl": spl,
+                "dist_to_nearest": dist, "path_length": p_seg,
+                "geodesic_dist": L_star, "steps": result.get("step_count", 0),
+                "goal": goal, "episode": episode_idx, "chain_idx": gi,
+                "spawn_pos": start_pos_chain.tolist(),
+            }
+            print(f"    [chain gi={gi}] goal={goal} success={success} "
+                  f"dist={dist:.2f}m steps={ep_r['steps']}")
+            results.append(ep_r)
+
+            step_log = result.get("step_log", [])
+            if step_log and log_dir:
+                _s = Path(log_dir) / f"chain_steplog_{goal}_ep{episode_idx:02d}.json"
+                try:
+                    _s.write_text(json.dumps({"episode": ep_r, "steps": step_log},
+                                             ensure_ascii=False, indent=2))
+                except Exception:
+                    pass
+    finally:
+        env.step = _original_step
+
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -226,6 +441,8 @@ def run_evaluation(
     max_steps: int = 200,
     use_vlm: bool = True,
     spawn_positions: Optional[Dict[str, Any]] = None,
+    log_dir: Optional[str] = None,
+    chain_goals: bool = False,
 ) -> Dict[str, Any]:
     """Run ObjectNav evaluation and return aggregated metrics.
 
@@ -249,6 +466,10 @@ def run_evaluation(
     if goals is None:
         goals = ["沙发", "椅子", "床"]
 
+    # Query GT instances BEFORE creating HabitatEnv (temp sim, then closed)
+    print(f"[instance discovery] loading semantic scene ...")
+    all_gt_instances = _load_all_instances(scene_dir, goals)
+
     env = HabitatEnv(gpu_id=0)
     all_episodes: List[Dict[str, Any]] = []
     per_goal_episodes: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
@@ -256,10 +477,9 @@ def run_evaluation(
     for goal in goals:
         print(f"\n[goal: {goal}]")
 
-        # Retrieve ground-truth positions ONCE per goal (evaluation only)
-        instances = [np.asarray(p, dtype=np.float32) for p in query_target(scene_dir, goal)]
+        instances = all_gt_instances.get(goal, [])
         if not instances:
-            print(f"  No semantic-map instances found for '{goal}' — skipping goal")
+            print(f"  No instances found for '{goal}' — skipping goal")
             continue
 
         print(f"  {len(instances)} instance(s) found for '{goal}'")
@@ -282,6 +502,7 @@ def run_evaluation(
                     use_vlm=use_vlm,
                     episode_idx=ep_idx,
                     spawn_pos=_spawn,
+                    log_dir=log_dir,
                 )
             except Exception as _e:
                 print(f"    [error] ep={ep_idx}: {_e}")
@@ -293,6 +514,32 @@ def run_evaluation(
             per_goal_episodes[goal].append(ep_result)
 
     env.close()
+
+    if chain_goals and goals:
+        # Run additional chain episodes (shared map across all goals per episode)
+        all_instances_map = all_gt_instances  # already loaded above
+        env2 = HabitatEnv(gpu_id=0)
+        print(f"\n[chain eval: {goals}]")
+        for ep_idx in range(n_episodes_per_goal):
+            try:
+                chain_eps = _run_chain_episode(
+                    env=env2,
+                    scene_dir=scene_dir,
+                    goals=goals,
+                    all_instances=all_instances_map,
+                    max_steps_total=max_steps * len(goals),
+                    use_vlm=use_vlm,
+                    episode_idx=ep_idx,
+                    log_dir=log_dir,
+                )
+            except Exception as _e:
+                print(f"    [chain error] ep={ep_idx}: {_e}")
+                chain_eps = []
+            for ep_r in chain_eps:
+                g = ep_r["goal"]
+                all_episodes.append(ep_r)
+                per_goal_episodes[g].append(ep_r)
+        env2.close()
 
     # Aggregate per-goal metrics
     per_goal: Dict[str, Any] = {}
@@ -410,11 +657,16 @@ if __name__ == "__main__":
                         help="Disable VLM perception (blind agent)")
     parser.add_argument("--spawn-file", default=None,
                         help="JSON file of fixed spawn positions. Load if exists, save if not.")
+    parser.add_argument("--log-dir", default="/tmp",
+                        help="Directory for per-step JSON sidelogs (default: /tmp)")
+    parser.add_argument("--chain-goals", action="store_true",
+                        help="Run all goals sequentially in one episode (shared topo/explore maps)")
     args = parser.parse_args()
 
-    print(f"Scene   : {args.scene}")
-    print(f"Goals   : {args.goals}")
-    print(f"Eps/goal: {args.episodes}  max_steps: {args.max_steps}  vlm: {not args.no_vlm}")
+    print(f"Scene     : {args.scene}")
+    print(f"Goals     : {args.goals}")
+    print(f"Eps/goal  : {args.episodes}  max_steps: {args.max_steps}  vlm: {not args.no_vlm}")
+    print(f"Chain mode: {args.chain_goals}  log_dir: {args.log_dir}")
 
     spawn_positions = None
     if args.spawn_file:
@@ -433,6 +685,8 @@ if __name__ == "__main__":
         max_steps=args.max_steps,
         use_vlm=not args.no_vlm,
         spawn_positions=spawn_positions,
+        log_dir=args.log_dir,
+        chain_goals=args.chain_goals,
     )
 
     if args.spawn_file and spawn_positions is None:

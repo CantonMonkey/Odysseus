@@ -59,28 +59,49 @@ class ExploreMap:
 
     # ── map update ──────────────────────────────────────────────────────
 
+    # Angle offset (radians) of each VLM direction from robot forward
+    _DIR_ANGLE = {"left": -0.45, "center": 0.0, "right": 0.45, "not_visible": 0.0}
+
     def update(
         self,
         agent_pos: np.ndarray,
         R: np.ndarray,
         vlm_score: float,
+        direction: str = "center",
         hfov: float = 90.0,
         view_radius: float = 4.0,
     ) -> None:
         """
-        Mark the camera's field-of-view footprint as EXPLORED and
-        update the VLM value map with *vlm_score*.
+        Mark the camera's FOV footprint as EXPLORED and update the value map.
 
-        agent_pos  : [x, y, z] robot base position in world frame
-        R          : 3×3 rotation matrix (agent-local → world)
-        vlm_score  : 0-1, how confident VLM is that target is in current view
+        Uses directional weighting (VLFM-style): cells aligned with the VLM's
+        reported target direction receive full score; opposing cells receive a
+        minimum fraction. Weight = cos²(angle_to_vlm_dir), clamped to [0.1, 1].
+
+        agent_pos : [x, y, z] robot base position in world frame
+        R         : 3×3 rotation matrix (agent-local → world)
+        vlm_score : 0-1, VLM relevance score
+        direction : VLM-reported target direction ("left"/"center"/"right"/"not_visible")
         """
-        # Forward direction projected onto XZ plane
+        # Forward direction in XZ plane
         fwd = R @ np.array([0.0, 0.0, -1.0])
         fwd_xz = np.array([fwd[0], fwd[2]])
         norm = np.linalg.norm(fwd_xz)
         if norm > 1e-6:
             fwd_xz /= norm
+
+        # Right direction in XZ plane (for computing lateral offset)
+        right = R @ np.array([1.0, 0.0, 0.0])
+        right_xz = np.array([right[0], right[2]])
+        right_norm = np.linalg.norm(right_xz)
+        if right_norm > 1e-6:
+            right_xz /= right_norm
+
+        # Target direction vector: forward rotated by VLM direction angle
+        dir_angle = self._DIR_ANGLE.get(direction, 0.0)
+        ca, sa = np.cos(dir_angle), np.sin(dir_angle)
+        # Rotate fwd_xz by dir_angle around up-axis
+        tgt_dir = ca * fwd_xz + sa * right_xz
 
         half_fov = np.radians(hfov / 2.0)
         ri, rj   = self._w2g(agent_pos[0], agent_pos[2])
@@ -95,15 +116,19 @@ class ExploreMap:
                 dist   = np.sqrt(dx * dx + dz * dz)
                 if dist < 0.01 or dist > view_radius:
                     continue
-                # Angle from robot forward to this cell
-                cos_a = float(np.dot(fwd_xz, np.array([dx, dz]) / dist))
-                if cos_a < np.cos(half_fov):
+                cell_dir = np.array([dx, dz]) / dist
+                # Must be within camera FOV
+                cos_fov = float(np.dot(fwd_xz, cell_dir))
+                if cos_fov < np.cos(half_fov):
                     continue
                 self.grid[i, j] = EXPLORED
-                # Exponential moving average
+                # Directional weight: cos²(angle between cell and VLM direction)
+                cos_dir = float(np.dot(tgt_dir, cell_dir))
+                dir_weight = max(0.1, cos_dir * cos_dir)
+                # EMA update with directional weighting
                 self.value[i, j] = (
                     (1.0 - SCORE_ALPHA) * self.value[i, j]
-                    + SCORE_ALPHA * vlm_score
+                    + SCORE_ALPHA * vlm_score * dir_weight
                 )
 
         # Robot's immediate neighbourhood is always explored
