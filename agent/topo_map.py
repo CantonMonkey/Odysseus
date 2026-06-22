@@ -8,7 +8,6 @@ it was created.  Provides:
   - get_nodes_by_floor / has_explored_floor
   - find_room_node : nearest node with a matching room keyword
   - suggest_goal_direction : commonsense reasoning over the graph
-  - find_staircase_approach : sample navmesh to locate floor-2 entrance
   - summary        : compact textual summary for logging
 """
 
@@ -204,46 +203,6 @@ class TopoMap:
 
         # 5. Default: keep exploring
         return {"action": "explore"}
-
-    # ------------------------------------------------------------------
-
-    def find_staircase_approach(
-        self,
-        env,
-        robot_pos: np.ndarray,
-        n_samples: int = 100,
-        y_threshold: float = 1.5,
-    ) -> Optional[np.ndarray]:
-        """Sample navmesh points and return the nearest one above *y_threshold*.
-
-        This identifies staircase entries or second-floor landing points
-        without any semantic labelling.
-
-        Parameters
-        ----------
-        env       : HabitatEnv — must have ._sim.pathfinder
-        robot_pos : current agent position
-        n_samples : number of random navmesh samples
-        y_threshold : Y coordinate above which a point is considered upper-floor
-
-        Returns
-        -------
-        np.ndarray [x, y, z] of the nearest upper-floor navmesh point, or None.
-        """
-        robot_pos = np.asarray(robot_pos, dtype=np.float32)
-        pf = env._sim.pathfinder
-
-        upper_points = []
-        for _ in range(n_samples):
-            pt = pf.get_random_navigable_point()
-            if not np.any(np.isnan(pt)) and float(pt[1]) > y_threshold:
-                upper_points.append(np.asarray(pt, dtype=np.float32))
-
-        if not upper_points:
-            return None
-
-        # Return the upper-floor point nearest to the robot
-        return min(upper_points, key=lambda p: float(np.linalg.norm(p - robot_pos)))
 
     # ------------------------------------------------------------------
 

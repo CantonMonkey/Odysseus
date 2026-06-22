@@ -7,7 +7,7 @@ Pipeline:
      (built from classify_scene() every CLASSIFY_INTERVAL steps)
   3. Frontier selection biased by topo_map.suggest_goal_direction():
        goto      → navigate to known room node
-       go_upstairs → find staircase via navmesh sampling
+       go_upstairs → navigate to visually-detected staircase position
        explore   → default value-weighted frontier
   4. VLM perception every VLM_CALL_INTERVAL steps:
        target visible + confidence ≥ threshold → depth-estimate 3D pos
@@ -200,28 +200,12 @@ def _explore_frontier(env, nav_state: dict, explore_map: ExploreMap,
             else:
                 _log(f"  [FRONTIER step={step}] topo_hint=goto → known room node at ({target[0]:.1f},{target[2]:.1f})")
         elif action_type == "go_upstairs":
-            stair = topo_map.find_staircase_approach(env, robot_pos)
-            if stair is not None:
-                target = stair
-                _log(f"  [FRONTIER step={step}] topo_hint=go_upstairs → staircase at ({stair[0]:.1f},{stair[2]:.1f})")
+            _sighting = nav_state.get("staircase_sighting")
+            if _sighting is not None:
+                target = np.array(_sighting, dtype=np.float32)
+                _log(f"  [FRONTIER step={step}] topo_hint=go_upstairs → staircase sighting at ({target[0]:.1f},{target[2]:.1f})")
             else:
-                # Single-story scene: no staircase found → seek farthest unexplored area
-                _pf_up = env._sim.pathfinder
-                _up_cands = []
-                for _ in range(60):
-                    _rp_up = _pf_up.get_random_navigable_point()
-                    if not np.any(np.isnan(_rp_up)):
-                        _d_up = float(np.linalg.norm(np.array(_rp_up) - robot_pos))
-                        if _d_up > 6.0:
-                            _gi_up, _gj_up = explore_map._w2g(_rp_up[0], _rp_up[2])
-                            if explore_map._valid(_gi_up, _gj_up) and explore_map.grid[_gi_up, _gj_up] == 0:
-                                _up_cands.append((_d_up, _rp_up))
-                if _up_cands:
-                    _up_cands.sort(key=lambda x: -x[0])
-                    target = _up_cands[0][1]
-                    _log(f"  [FRONTIER step={step}] no_staircase → farthest_unexplored ({target[0]:.1f},{target[2]:.1f}) d={_up_cands[0][0]:.1f}m")
-                else:
-                    _log(f"  [FRONTIER step={step}] no_staircase + no_unexplored → value-map")
+                _log(f"  [FRONTIER step={step}] topo_hint=go_upstairs → no staircase seen yet → value-map")
         else:
             _log(f"  [FRONTIER step={step}] topo_hint={action_type} → value-map frontier selection")
 
@@ -562,6 +546,13 @@ def run_task(
                 room        = percept.get("room", "other")
                 rel         = float(percept.get("relevance", 0.0))
                 target_room = str(percept.get("target_room", "") or "").strip()
+
+                # Record the robot's position when it visually detects a staircase.
+                # Used by go_upstairs to navigate there without navmesh sampling.
+                if room == "staircase":
+                    nav_state["staircase_sighting"] = robot_pos.tolist()
+                    _log(f"  [STAIRCASE step={step}] sighted at ({robot_pos[0]:.1f},{robot_pos[2]:.1f})")
+
                 idist      = _inst_dist(robot_pos, instances)
                 idist_s    = f"{idist:.2f}m" if idist is not None else "N/A"
 
@@ -1101,16 +1092,17 @@ def run_task(
                 topo_map.add_node(robot_pos, _rm, _objs, step)
                 _log(f"  [CLASSIFY step={step}] room={_rm} floor={_fh} suggest={_sug} objects={_objs}")
                 if _sug == "go_upstairs" and not topo_map.has_explored_floor(1):
-                    stair = topo_map.find_staircase_approach(env, robot_pos)
-                    if stair is not None:
+                    _sighting = nav_state.get("staircase_sighting")
+                    if _sighting is not None:
                         from agent.skills import _replan
-                        wps = _replan(env, robot_pos, stair)
+                        _stair = np.array(_sighting, dtype=np.float32)
+                        wps = _replan(env, robot_pos, _stair)
                         if wps:
-                            nav_state["frontier_pos"]     = stair.tolist()
-                            nav_state["waypoints"]        = wps
+                            nav_state["frontier_pos"]      = _sighting
+                            nav_state["waypoints"]         = wps
                             nav_state["anchor_steps_left"] = 60
-                            nav_state["explore_anchor"]   = stair.tolist()
-                            _log(f"  [GO-UPSTAIRS step={step}] → ({stair[0]:.1f},{stair[2]:.1f})")
+                            nav_state["explore_anchor"]    = _sighting
+                            _log(f"  [GO-UPSTAIRS step={step}] → ({_stair[0]:.1f},{_stair[2]:.1f})")
             except Exception as _ce:
                 _log(f"  [CLASSIFY ERROR step={step}] {_ce}")
 
