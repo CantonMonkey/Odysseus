@@ -53,18 +53,25 @@ from agent.semantic_map import CHINESE_TO_CATEGORY, IGNORE_CATEGORIES
 # Instance discovery (evaluation only — uses Habitat's semantic scene)
 # ---------------------------------------------------------------------------
 
+def _glb_to_habitat(p: np.ndarray) -> np.ndarray:
+    """Convert GLB Z-up local coords to Habitat Y-up world coords.
+
+    HM3D semantic.glb files are authored in Z-up convention; Habitat uses Y-up.
+    Ground-floor objects snap fine without the transform (small Y offset stays
+    within the 2m snap threshold), but upper-floor objects (beds, Y_glb≈6.7)
+    land far outside the navmesh unless transformed first.
+    """
+    return np.array([p[0], p[2], -p[1]], dtype=np.float32)
+
+
 def _load_all_instances(scene_dir: str, goals: List[str],
                         snap_threshold: float = 2.0) -> dict:
     """Load GT instance positions for all goals using navmesh snapping.
 
     Parses 3D vertex positions from <scene>.semantic.glb via trimesh
-    (cached in semantic_cache.json), then snaps each position to the Habitat
-    navmesh.  Positions that don't snap within snap_threshold metres are
-    unreachable (second floor, ceiling, wall) and are discarded.
-
-    Using navmesh snapping rather than a raw Y-threshold handles coordinate
-    mismatches between the semantic GLB frame and Habitat world, and naturally
-    excludes objects on floors the agent can't reach.
+    (cached in semantic_cache.json), applies the GLB→Habitat coordinate
+    transform, then snaps each position to the navmesh.  Positions that
+    don't snap within snap_threshold metres are unreachable and discarded.
     """
     from agent.semantic_map import query_target
 
@@ -87,9 +94,10 @@ def _load_all_instances(scene_dir: str, goals: List[str],
                    for p in query_target(scene_dir, goal)]
             snapped = []
             for p in raw:
-                sp = pf.snap_point(p)
+                p_hab = _glb_to_habitat(p)
+                sp = pf.snap_point(p_hab)
                 if not np.isnan(sp).any():
-                    d = float(np.linalg.norm(sp - p))
+                    d = float(np.linalg.norm(sp - p_hab))
                     if d < snap_threshold:
                         snapped.append(sp)
             result[goal] = snapped

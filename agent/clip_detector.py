@@ -48,11 +48,14 @@ class CLIPDetector:
             print(f"[CLIP] ready ({cls._device})", flush=True)
         return cls._model, cls._processor, cls._device
 
-    # Raw cosim rescaling constants (VLFM-style).
-    # CLIP ViT-B/32 cosim range: ~0.14 (background) to ~0.35 (clear target match).
-    # Rescale so that 0.14→0 and 0.36→1: score = clip((cosim - COSIM_LO) / COSIM_RANGE, 0, 1)
-    _COSIM_LO    = 0.14
-    _COSIM_RANGE = 0.22   # 0.14 + 0.22 = 0.36 maps to 1.0
+    # Raw cosim rescaling constants calibrated from v5 eval data.
+    # Observed ViT-B/32 cosim: ~0.22 background, ~0.25 target visible.
+    # Tighter window pushes background below threshold and target above it:
+    #   raw 0.22 (bg)      → rescaled 0.11  (< 0.40 visible threshold)
+    #   raw 0.25 (visible) → rescaled 0.44  (> 0.40 threshold)
+    #   raw 0.26 (clear)   → rescaled 0.56  (> 0.50 VALUE-STOP threshold)
+    _COSIM_LO    = 0.21
+    _COSIM_RANGE = 0.09
 
     @classmethod
     def detect(cls, frame_rgb: np.ndarray, goal_zh: str,
