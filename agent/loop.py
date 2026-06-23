@@ -7,7 +7,7 @@ Pipeline:
      (built from classify_scene() every CLASSIFY_INTERVAL steps)
   3. Frontier selection biased by topo_map.suggest_goal_direction():
        goto      → navigate to known room node
-       go_upstairs → find staircase via navmesh sampling
+       go_upstairs → navigate to visually-detected staircase position
        explore   → default value-weighted frontier
   4. VLM perception every VLM_CALL_INTERVAL steps:
        target visible + confidence ≥ threshold → depth-estimate 3D pos
@@ -200,28 +200,12 @@ def _explore_frontier(env, nav_state: dict, explore_map: ExploreMap,
             else:
                 _log(f"  [FRONTIER step={step}] topo_hint=goto → known room node at ({target[0]:.1f},{target[2]:.1f})")
         elif action_type == "go_upstairs":
-            stair = topo_map.find_staircase_approach(env, robot_pos)
-            if stair is not None:
-                target = stair
-                _log(f"  [FRONTIER step={step}] topo_hint=go_upstairs → staircase at ({stair[0]:.1f},{stair[2]:.1f})")
+            _sighting = nav_state.get("staircase_sighting")
+            if _sighting is not None:
+                target = np.array(_sighting, dtype=np.float32)
+                _log(f"  [FRONTIER step={step}] topo_hint=go_upstairs → staircase sighting at ({target[0]:.1f},{target[2]:.1f})")
             else:
-                # Single-story scene: no staircase found → seek farthest unexplored area
-                _pf_up = env._sim.pathfinder
-                _up_cands = []
-                for _ in range(60):
-                    _rp_up = _pf_up.get_random_navigable_point()
-                    if not np.any(np.isnan(_rp_up)):
-                        _d_up = float(np.linalg.norm(np.array(_rp_up) - robot_pos))
-                        if _d_up > 6.0:
-                            _gi_up, _gj_up = explore_map._w2g(_rp_up[0], _rp_up[2])
-                            if explore_map._valid(_gi_up, _gj_up) and explore_map.grid[_gi_up, _gj_up] == 0:
-                                _up_cands.append((_d_up, _rp_up))
-                if _up_cands:
-                    _up_cands.sort(key=lambda x: -x[0])
-                    target = _up_cands[0][1]
-                    _log(f"  [FRONTIER step={step}] no_staircase → farthest_unexplored ({target[0]:.1f},{target[2]:.1f}) d={_up_cands[0][0]:.1f}m")
-                else:
-                    _log(f"  [FRONTIER step={step}] no_staircase + no_unexplored → value-map")
+                _log(f"  [FRONTIER step={step}] topo_hint=go_upstairs → no staircase seen yet → value-map")
         else:
             _log(f"  [FRONTIER step={step}] topo_hint={action_type} → value-map frontier selection")
 
@@ -562,6 +546,13 @@ def run_task(
                 room        = percept.get("room", "other")
                 rel         = float(percept.get("relevance", 0.0))
                 target_room = str(percept.get("target_room", "") or "").strip()
+
+                # Record the robot's position when it visually detects a staircase.
+                # Used by go_upstairs to navigate there without navmesh sampling.
+                if room == "staircase":
+                    nav_state["staircase_sighting"] = robot_pos.tolist()
+                    _log(f"  [STAIRCASE step={step}] sighted at ({robot_pos[0]:.1f},{robot_pos[2]:.1f})")
+
                 idist      = _inst_dist(robot_pos, instances)
                 idist_s    = f"{idist:.2f}m" if idist is not None else "N/A"
 
@@ -653,9 +644,10 @@ def run_task(
                                 tgt = None
                                 nav_state["stagnant_steps"] = nav_state.get("stagnant_steps", 0) + 20
                         else:
-                            # No GT instances: try CLIP bbox first, then direction-based fallback.
-                            # CLIP bbox (from CLIP-MERGE or last_clip) is more precise than
-                            # the direction strip; direction-based is the last resort.
+                            # No GT instances: try CLIP bbox depth only.
+                            # Direction-based 5m guess is disabled — it's less accurate
+                            # than the value-map frontier and causes the robot to waste
+                            # 100-400 steps navigating to empty space.
                             _bbox_s = (percept.get("bbox")
                                        or nav_state.get("last_clip", {}).get("bbox"))
                             _btgt_s = _estimate_pos_from_bbox(
@@ -667,12 +659,9 @@ def run_task(
                                 _log(f"  [SNAP step={step}] no instances → bbox depth "
                                      f"({tgt[0]:.2f},{tgt[2]:.2f}) d={float(np.linalg.norm(tgt-robot_pos)):.1f}m")
                             else:
-                                # tgt still holds direction-based estimate from _estimate_target_pos
-                                if tgt is not None:
-                                    _log(f"  [SNAP step={step}] no instances, no bbox → dir-based "
-                                         f"({tgt[0]:.2f},{tgt[2]:.2f}) d={float(np.linalg.norm(tgt-robot_pos)):.1f}m")
-                                else:
-                                    _log(f"  [SNAP step={step}] no instances + no depth → skip")
+                                # No real 3D signal — let value-map frontier drive navigation.
+                                tgt = None
+                                _log(f"  [SNAP step={step}] no instances, no bbox → frontier-only (rel={rel:.2f})")
 
                         if tgt is not None:
                             old_skill = nav_state.get("current_skill")
@@ -953,8 +942,40 @@ def run_task(
         if _prior is not None:
             # Blend: 70% room prior + 30% VLM relevance (retains some per-frame signal)
             vlm_score = 0.7 * _prior + 0.3 * vlm_score
-        _log(f"  [VMAP step={step}] room={_vmap_room} prior={_prior} raw={_raw_score:.2f} → score={vlm_score:.2f} dir={_vmap_dir}")
+        # CLIP override: use live per-step score when object is visible.
+        # This is the core of VLFM — dense value-map update from image-text
+        # similarity at every step, not sparse 8-step VLM relevance.
+        _clip_r_vm   = nav_state.get("last_clip", {})
+        _clip_vis_vm = _clip_r_vm.get("visible", False)
+        _clip_sc_vm  = float(_clip_r_vm.get("score", 0.0))
+        _clip_dir_vm = _clip_r_vm.get("direction", "center")
+        # With raw cosim rescaling (Fix B), visible=True already means cosim>0.40
+        # (threshold in detect()). Extra 0.30 guard ensures meaningful signal.
+        if _clip_vis_vm and _clip_sc_vm > 0.30:
+            vlm_score = _clip_sc_vm
+            _vmap_dir = _clip_dir_vm
+            _log(f"  [VMAP step={step}] CLIP-driven score={vlm_score:.2f} dir={_vmap_dir}")
+        else:
+            _log(f"  [VMAP step={step}] room={_vmap_room} prior={_prior} raw={_raw_score:.2f} → score={vlm_score:.2f} dir={_vmap_dir}")
         explore_map.update(robot_pos, R, vlm_score, direction=_vmap_dir)
+
+        # ── VLFM proximity stop ────────────────────────────────────────
+        # Require BOTH CLIP signal AND VLM target_visible confirmation.
+        # With cosim rescaling, 0.50 ≈ raw cosim 0.25 (genuine target match).
+        # Guard: require step >= 50 so the robot leaves spawn first.
+        _vlm_vis_vm = nav_state.get("last_percept", {}).get("target_visible", False)
+        if (step >= 50
+                and not nav_state.get("done", False)
+                and nav_state.get("current_skill") not in ("verify_arrival", "done")
+                and _clip_sc_vm > 0.50
+                and _vlm_vis_vm):
+            _bvp = explore_map.best_value_pos(robot_pos)
+            if _bvp is not None:
+                _bvd = float(np.sqrt(
+                    (robot_pos[0] - _bvp[0])**2 + (robot_pos[2] - _bvp[2])**2))
+                if _bvd < 1.5:
+                    _log(f"  [VALUE-STOP step={step}] dist_to_best_cell={_bvd:.2f}m CLIP={_clip_sc_vm:.2f} → done")
+                    nav_state["done"] = True
 
         # ── Stagnation / ESCAPE ────────────────────────────────────────
         if current_skill == "explore_frontier":
@@ -1071,16 +1092,17 @@ def run_task(
                 topo_map.add_node(robot_pos, _rm, _objs, step)
                 _log(f"  [CLASSIFY step={step}] room={_rm} floor={_fh} suggest={_sug} objects={_objs}")
                 if _sug == "go_upstairs" and not topo_map.has_explored_floor(1):
-                    stair = topo_map.find_staircase_approach(env, robot_pos)
-                    if stair is not None:
+                    _sighting = nav_state.get("staircase_sighting")
+                    if _sighting is not None:
                         from agent.skills import _replan
-                        wps = _replan(env, robot_pos, stair)
+                        _stair = np.array(_sighting, dtype=np.float32)
+                        wps = _replan(env, robot_pos, _stair)
                         if wps:
-                            nav_state["frontier_pos"]     = stair.tolist()
-                            nav_state["waypoints"]        = wps
+                            nav_state["frontier_pos"]      = _sighting
+                            nav_state["waypoints"]         = wps
                             nav_state["anchor_steps_left"] = 60
-                            nav_state["explore_anchor"]   = stair.tolist()
-                            _log(f"  [GO-UPSTAIRS step={step}] → ({stair[0]:.1f},{stair[2]:.1f})")
+                            nav_state["explore_anchor"]    = _sighting
+                            _log(f"  [GO-UPSTAIRS step={step}] → ({_stair[0]:.1f},{_stair[2]:.1f})")
             except Exception as _ce:
                 _log(f"  [CLASSIFY ERROR step={step}] {_ce}")
 

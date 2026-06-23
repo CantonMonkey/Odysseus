@@ -53,56 +53,58 @@ from agent.semantic_map import CHINESE_TO_CATEGORY, IGNORE_CATEGORIES
 # Instance discovery (evaluation only — uses Habitat's semantic scene)
 # ---------------------------------------------------------------------------
 
-def _load_all_instances(scene_dir: str, goals: List[str]) -> dict:
-    """Load GT instance positions for all goals using a temporary sim with the
-    annotated dataset config (which provides semantic_scene.objects in correct
-    Habitat world coordinates).
+def _glb_to_habitat(p: np.ndarray) -> np.ndarray:
+    """Convert GLB Z-up local coords to Habitat Y-up world coords.
 
-    The temporary sim is closed before HabitatEnv is created to avoid double
-    GPU allocation.  Falls back to semantic_map.query_target() if the annotated
-    config file is not present.
+    HM3D semantic.glb files are authored in Z-up convention; Habitat uses Y-up.
+    Ground-floor objects snap fine without the transform (small Y offset stays
+    within the 2m snap threshold), but upper-floor objects (beds, Y_glb≈6.7)
+    land far outside the navmesh unless transformed first.
     """
-    from pathlib import Path as _Path
+    return np.array([p[0], p[2], -p[1]], dtype=np.float32)
+
+
+def _load_all_instances(scene_dir: str, goals: List[str],
+                        snap_threshold: float = 2.0) -> dict:
+    """Load GT instance positions for all goals using navmesh snapping.
+
+    Parses 3D vertex positions from <scene>.semantic.glb via trimesh
+    (cached in semantic_cache.json), applies the GLB→Habitat coordinate
+    transform, then snaps each position to the navmesh.  Positions that
+    don't snap within snap_threshold metres are unreachable and discarded.
+    """
     from agent.semantic_map import query_target
 
-    scene_dir_p = _Path(scene_dir)
+    scene_dir_p = Path(scene_dir)
     scene_id    = scene_dir_p.name.split("-", 1)[1]
     scene_glb   = str(scene_dir_p / f"{scene_id}.basis.glb")
-    dataset_cfg = str(scene_dir_p.parent / "hm3d_annotated_basis.scene_dataset_config.json")
 
-    result: dict = {}
+    # Temporary sim just to access the navmesh pathfinder.
+    _sim_cfg              = habitat_sim.SimulatorConfiguration()
+    _sim_cfg.scene_id     = scene_glb
+    _a_cfg                = habitat_sim.agent.AgentConfiguration()
+    _a_cfg.sensor_specifications = []
+    _tmp_sim = habitat_sim.Simulator(habitat_sim.Configuration(_sim_cfg, [_a_cfg]))
+    pf       = _tmp_sim.pathfinder
 
-    if _Path(dataset_cfg).exists():
-        cfg = habitat_sim.SimulatorConfiguration()
-        cfg.scene_id = scene_glb
-        cfg.scene_dataset_config_file = dataset_cfg
-        agent_cfg = habitat_sim.agent.AgentConfiguration()
-        agent_cfg.sensor_specifications = []
-        _sim = habitat_sim.Simulator(habitat_sim.Configuration(cfg, [agent_cfg]))
-        try:
-            for goal in goals:
-                keywords = CHINESE_TO_CATEGORY.get(goal, [goal.lower()])
-                positions, seen = [], set()
-                for obj in _sim.semantic_scene.objects:
-                    if obj is None or obj.category is None:
-                        continue
-                    name = obj.category.name().lower()
-                    if any(k in name for k in keywords) and name not in IGNORE_CATEGORIES:
-                        c = obj.aabb.center
-                        key = (round(float(c[0]), 1), round(float(c[2]), 1))
-                        if key not in seen:
-                            seen.add(key)
-                            positions.append(np.array(
-                                [float(c[0]), float(c[1]), float(c[2])], dtype=np.float32))
-                result[goal] = positions
-                print(f"  [semantic_scene] '{goal}': {len(positions)} instance(s)")
-        finally:
-            _sim.close()
-    else:
-        print(f"  [warn] annotated dataset config not found — using semantic_map fallback")
+    try:
+        result: dict = {}
         for goal in goals:
-            result[goal] = [np.asarray(p, dtype=np.float32)
-                            for p in query_target(scene_dir, goal)]
+            raw = [np.asarray(p, dtype=np.float32)
+                   for p in query_target(scene_dir, goal)]
+            snapped = []
+            for p in raw:
+                p_hab = _glb_to_habitat(p)
+                sp = pf.snap_point(p_hab)
+                if not np.isnan(sp).any():
+                    d = float(np.linalg.norm(sp - p_hab))
+                    if d < snap_threshold:
+                        snapped.append(sp)
+            result[goal] = snapped
+            print(f"  [semantic_map] '{goal}': {len(snapped)}/{len(raw)} "
+                  f"navmesh-reachable instance(s) (snap_thr={snap_threshold}m)")
+    finally:
+        _tmp_sim.close()
 
     return result
 
@@ -405,8 +407,10 @@ def _run_chain_episode(
             denom   = max(L_star, p_seg)
             spl     = (float(success) * L_star / denom) if denom > 0 else 0.0
 
+            soft_success = max(0.0, (SUCCESS_DIST - dist) / SUCCESS_DIST)
+            soft_spl = (soft_success * L_star / denom) if denom > 0 else 0.0
             ep_r = {
-                "success": success, "spl": spl,
+                "success": success, "spl": spl, "soft_spl": soft_spl,
                 "dist_to_nearest": dist, "path_length": p_seg,
                 "geodesic_dist": L_star, "steps": result.get("step_count", 0),
                 "goal": goal, "episode": episode_idx, "chain_idx": gi,

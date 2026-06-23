@@ -188,6 +188,18 @@ class ExploreMap:
         wx, wz = self._g2w(*best_ij)
         return np.array([wx, robot_pos[1], wz], dtype=np.float32)
 
+    def best_value_pos(self, robot_pos: np.ndarray) -> "Optional[np.ndarray]":
+        """Return world-frame [x, y, z] of the cell with the highest value score.
+
+        Used for VLFM-style proximity stopping: if the robot is within 1.5 m of
+        this cell and CLIP is confident, we declare the episode done.
+        Returns None when the map has no meaningful signal yet.
+        """
+        if float(self.value.max()) < 0.3:
+            return None
+        idx = np.unravel_index(int(self.value.argmax()), self.value.shape)
+        wx, wz = self._g2w(idx[0], idx[1])
+        return np.array([wx, robot_pos[1], wz], dtype=np.float32)
 
     def top_k_frontiers(self, k: int, robot_pos: np.ndarray):
         """Return up to k best frontiers as [(score, world_xyz), ...]."""
