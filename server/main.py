@@ -85,12 +85,19 @@ def _habitat_worker():
 
                 overhead = env.get_overhead_frame()
                 if overhead is not None:
+                    _pct = float(np.count_nonzero(overhead)) / overhead.size
+                    if _pct < 0.01:
+                        print(f"[Server] overhead {_pct:.1%} nonzero — camera inside geometry", flush=True)
                     _frame_q.put(("overhead", overhead, state))
 
-                if step % 10 == 0 and _explore_map is not None:
-                    robot_pose = env.get_robot_pose()
-                    map_png = _map_to_png(_explore_map, robot_pose)
-                    _frame_q.put(("map", map_png, state))
+                # Read live explore_map from nav_state (was using server-level
+                # _explore_map which is None during navigation).
+                if step % 10 == 0:
+                    _live_map = nav_state.get("explore_map")
+                    if _live_map is not None:
+                        robot_pose = env.get_robot_pose()
+                        map_png = _map_to_png(_live_map, robot_pose)
+                        _frame_q.put(("map", map_png, state))
 
             def on_thought(step, skill, reason):
                 _frame_q.put(("thought", None, {

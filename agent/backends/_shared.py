@@ -95,11 +95,11 @@ def _build_perceive_prompt(goal: str, n_waypoints: int = 0, context: dict = None
     _ex_sk_y = ',"skill":"snap","reason":"target visible"'    if skill_field else ""
     _ex_sk_n = ',"skill":"explore","reason":"not found"'      if skill_field else ""
     _ex_vis  = (
-        '{"direction":"center","confidence":0.85,"room":"living_room","relevance":0.9'
+        '{"direction":"center","confidence":0.85,"room":"living_room","relevance":0.9,"search_direction":"none"'
         + _ex_wp + _ex_sk_y + "}"
     )
     _ex_hid  = (
-        '{"direction":"not_visible","confidence":0.0,"room":"hallway","relevance":0.3'
+        '{"direction":"not_visible","confidence":0.0,"room":"hallway","relevance":0.3,"search_direction":"left"'
         + _ex_wp + _ex_sk_n + "}"
     )
     return (
@@ -109,7 +109,8 @@ def _build_perceive_prompt(goal: str, n_waypoints: int = 0, context: dict = None
         + "REQUIRED JSON:\n"
         + '{"direction":"left|center|right|not_visible","confidence":float,'
         + '"room":"living_room|bedroom|hallway|kitchen|staircase|bathroom|other",'
-        + f'"relevance":float{waypoint_field}{skill_field}}}\n'
+        + f'"relevance":float,"search_direction":"left|center|right|upstairs|none"'
+        + f'{waypoint_field}{skill_field}}}\n'
         + f"EXAMPLE when {goal} visible: {_ex_vis}\n"
         + f"EXAMPLE when {goal} not visible: {_ex_hid}\n"
         + "Rules:\n"
@@ -119,6 +120,7 @@ def _build_perceive_prompt(goal: str, n_waypoints: int = 0, context: dict = None
         + f"- relevance: 0.0-1.0, use ROOM COMMONSENSE — where is {goal} typically found?\n"
         + f"  ({_room_hint})\n"
         + f"  If you are in the WRONG room type for {goal}, relevance must be LOW (≤0.2).\n"
+        + f"- search_direction: when {goal} NOT visible, which direction most likely leads toward a room containing it? (left/center/right based on visible doorways/hallways, upstairs if stairs visible, none if unsure)\n"
         + waypoint_rule + skill_rules
     )
 

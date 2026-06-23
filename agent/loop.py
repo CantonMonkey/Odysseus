@@ -656,6 +656,8 @@ def run_task(
                                 tgt = _btgt_s
                                 nav_state["bbox_target"]        = True
                                 nav_state["target_arrive_dist"] = 0.5
+                                # Record snap XZ so verify_arrival can blacklist on failure
+                                nav_state["clip_snap_target"] = (round(float(tgt[0]), 1), round(float(tgt[2]), 1))
                                 _log(f"  [SNAP step={step}] no instances → bbox depth "
                                      f"({tgt[0]:.2f},{tgt[2]:.2f}) d={float(np.linalg.norm(tgt-robot_pos)):.1f}m")
                             else:
@@ -709,8 +711,24 @@ def run_task(
                     _log(f"  [BRAIN step={step}] skill={_skill} reason={str(_reason)[:80]!r}")
                     _r_clean = str(_reason).strip()
                     _skip = {'str','other','not_visible','bathroom','','clear','clearly visible'}
+                    # Append sensor-based depth distance when CLIP sees the target
+                    _dist_hint = ""
+                    _cr = nav_state.get("last_clip", {})
+                    if _cr.get("visible") and _cr.get("bbox"):
+                        try:
+                            x1, y1, x2, y2 = _cr["bbox"]
+                            cx, cy = int((x1 + x2) / 2), int((y1 + y2) / 2)
+                            _d = float(env.get_depth()[cy, cx])
+                            if 0.3 < _d < 10.0:
+                                _dist_hint = f" [~{_d:.1f}m]"
+                        except Exception:
+                            pass
+                    # Append search_direction hint when target not visible
+                    _sd = percept.get("search_direction", "")
+                    if _sd and _sd not in ("none", "") and not percept.get("target_visible", False):
+                        _dist_hint += f" → {_sd}"
                     if on_thought and _r_clean not in _skip and len(_r_clean) >= 12:
-                        on_thought(step, _skill, _r_clean)
+                        on_thought(step, _skill, _r_clean + _dist_hint)
                     _dh = nav_state.setdefault("decision_history", [])
                     _dh.append({"step": step, "skill": _skill, "reason": _r_clean[:60], "room": percept.get("room", "other")})
                     if len(_dh) > 3:
