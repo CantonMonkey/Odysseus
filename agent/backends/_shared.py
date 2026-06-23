@@ -89,7 +89,20 @@ def _build_perceive_prompt(goal: str, n_waypoints: int = 0, context: dict = None
         "厕所": "bathroom=0.95, hallway=0.3, bedroom=0.1, living_room=0.0",
         "水槽": "bathroom=0.8, kitchen=0.85, hallway=0.1, living_room=0.0",
     }
-    _room_hint = _ROOM_HINTS.get(goal, "use common sense about which rooms typically contain this object")
+    # Floor-level reasoning: which floor is each object most likely on?
+    # Used to guide staircase decisions ("go upstairs" vs "stay down").
+    _FLOOR_HINTS = {
+        "沙发": "ground floor (living room is almost always on ground floor)",
+        "床":   "upper floor preferred (bedrooms often upstairs); if you see stairs and haven't found it downstairs, go up",
+        "电视": "ground floor preferred (main living room), but may be in upstairs bedroom",
+        "桌子": "ground floor preferred (kitchen/dining), could be anywhere",
+        "冰箱": "ground floor ONLY — kitchens are never upstairs. Do NOT go upstairs for 冰箱",
+        "椅子": "ground floor preferred (kitchen/dining/living room)",
+        "厕所": "ground floor preferred, but some homes have upstairs bathroom",
+        "水槽": "ground floor preferred (kitchen/bathroom on ground floor)",
+    }
+    _room_hint  = _ROOM_HINTS.get(goal, "use common sense about which rooms typically contain this object")
+    _floor_hint = _FLOOR_HINTS.get(goal, "use common sense about which floor this object is on")
 
     _ex_wp   = ',"waypoint":0'   if waypoint_field else ""
     _ex_sk_y = ',"skill":"snap","reason":"target visible"'    if skill_field else ""
@@ -120,7 +133,11 @@ def _build_perceive_prompt(goal: str, n_waypoints: int = 0, context: dict = None
         + f"- relevance: 0.0-1.0, use ROOM COMMONSENSE — where is {goal} typically found?\n"
         + f"  ({_room_hint})\n"
         + f"  If you are in the WRONG room type for {goal}, relevance must be LOW (≤0.2).\n"
-        + f"- search_direction: when {goal} NOT visible, which direction most likely leads toward a room containing it? (left/center/right based on visible doorways/hallways, upstairs if stairs visible, none if unsure)\n"
+        + f"- search_direction: when {goal} NOT visible, reason step-by-step:\n"
+        + f"  1. Which room type does {goal} belong in? ({_room_hint})\n"
+        + f"  2. Which floor is it most likely on? ({_floor_hint})\n"
+        + f"  3. Based on what you see (doorways, hallways, stairs), pick the direction most likely to lead there.\n"
+        + f"  Output: left|center|right (if you see a promising door/hallway), upstairs (if stairs visible AND {goal} is more likely upstairs), none (if unsure)\n"
         + waypoint_rule + skill_rules
     )
 

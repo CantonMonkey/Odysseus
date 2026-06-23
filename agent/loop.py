@@ -439,12 +439,26 @@ def run_task(
                 nav_state["clip_streak"] = _cstrk
                 _log(f"  [CLIP step={step}] score={_clip_res['score']:.2f} "
                      f"streak={_cstrk} dir={_clip_res['direction']}")
-                # CLIP provides vis signal only; SNAP is handled by Phase 3 VLM path
-                # (CLIP's 4×3 patch bbox is too coarse for reliable 3D localization)
             else:
                 if nav_state.get("clip_streak", 0) > 0:
                     _log(f"  [CLIP step={step}] score={_clip_res['score']:.2f} → streak reset")
                 nav_state["clip_streak"] = 0
+
+        # ── CLIP-streak stop ───────────────────────────────────────────
+        # 5+ consecutive high-CLIP frames = object is continuously visible
+        # right in front of the robot. Stop now — no SNAP→follow_path→verify
+        # chain needed. This fires even when bbox depth fails (the common case
+        # in visual-only mode) and when the VLM hasn't called recently.
+        _cstrk_cur = nav_state.get("clip_streak", 0)
+        _clip_sc_cur = _clip_res.get("score", 0.0)
+        if (step >= 20
+                and not nav_state.get("done", False)
+                and nav_state.get("current_skill") not in ("verify_arrival", "done")
+                and _cstrk_cur >= 5
+                and _clip_sc_cur > 0.42):
+            _log(f"  [STREAK-STOP step={step}] streak={_cstrk_cur} "
+                 f"score={_clip_sc_cur:.2f} → done")
+            nav_state["done"] = True
 
         # ── VLFM-style VLM call ────────────────────────────────────────
         if llm_perceive is not None and (step - nav_state["vlm_step"]) >= VLM_CALL_INTERVAL:
@@ -660,8 +674,16 @@ def run_task(
                                 nav_state["clip_snap_target"] = (round(float(tgt[0]), 1), round(float(tgt[2]), 1))
                                 _log(f"  [SNAP step={step}] no instances → bbox depth "
                                      f"({tgt[0]:.2f},{tgt[2]:.2f}) d={float(np.linalg.norm(tgt-robot_pos)):.1f}m")
+                            elif _bbox_s is not None and tgt is not None:
+                                # bbox depth failed (too close / noisy) but CLIP saw something.
+                                # Keep the direction-based tgt from _estimate_target_pos — it points
+                                # ~3-5m in the VLM/CLIP direction. Robot navigates there, then
+                                # STREAK-STOP or VALUE-STOP fires when it gets close.
+                                _log(f"  [SNAP step={step}] no instances, bbox depth failed → "
+                                     f"direction fallback ({tgt[0]:.2f},{tgt[2]:.2f}) "
+                                     f"d={float(np.linalg.norm(tgt-robot_pos)):.1f}m")
                             else:
-                                # No real 3D signal — let value-map frontier drive navigation.
+                                # No CLIP bbox and no bbox from VLM — nothing to navigate toward.
                                 tgt = None
                                 _log(f"  [SNAP step={step}] no instances, no bbox → frontier-only (rel={rel:.2f})")
 
@@ -978,15 +1000,17 @@ def run_task(
         explore_map.update(robot_pos, R, vlm_score, direction=_vmap_dir)
 
         # ── VLFM proximity stop ────────────────────────────────────────
-        # Require BOTH CLIP signal AND VLM target_visible confirmation.
-        # With cosim rescaling, 0.50 ≈ raw cosim 0.25 (genuine target match).
-        # Guard: require step >= 50 so the robot leaves spawn first.
+        # CLIP > 0.50 (raw cosim ~0.26, clearly visible) AND either:
+        #   - VLM recently confirmed visible (target_visible in last_percept), OR
+        #   - CLIP streak >= 3 (3 consecutive high frames, no VLM call needed)
+        # The streak gate fixes cases where VLM fires every 8 steps and the
+        # 7-step gap between calls leaves _vlm_vis_vm stale at False.
         _vlm_vis_vm = nav_state.get("last_percept", {}).get("target_visible", False)
         if (step >= 50
                 and not nav_state.get("done", False)
                 and nav_state.get("current_skill") not in ("verify_arrival", "done")
                 and _clip_sc_vm > 0.50
-                and _vlm_vis_vm):
+                and (_vlm_vis_vm or nav_state.get("clip_streak", 0) >= 3)):
             _bvp = explore_map.best_value_pos(robot_pos)
             if _bvp is not None:
                 _bvd = float(np.sqrt(
