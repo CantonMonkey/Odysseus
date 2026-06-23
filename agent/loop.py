@@ -26,7 +26,7 @@ CLASSIFY_INTERVAL  = 24   # call classify_scene every N steps for room/floor rea
 
 from pathlib import Path
 import os as _os
-_DATA_DEFAULT = Path("/root/autodl-tmp/data/hm3d") if Path("/root/autodl-tmp/data/hm3d").exists() else Path("/data3/liangjy/vln/data/hm3d")
+_DATA_DEFAULT = Path("/root/autodl-tmp/data/hm3d")
 _DATA     = Path(_os.environ.get("VLN_DATA_DIR", str(_DATA_DEFAULT)))
 SCENE_DIR = str(_DATA / "00800-TEEsavR23oF")
 

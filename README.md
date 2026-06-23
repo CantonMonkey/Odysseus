@@ -85,7 +85,7 @@ python run.py
 
 SSH tunnel for local browser access:
 ```bash
-ssh -CNg -L 6006:127.0.0.1:6006 root@connect.nmb1.seetacloud.com -p 39333
+ssh -CNg -L 6006:127.0.0.1:6006 <user>@<server> -p <port>
 # then open http://localhost:6006
 ```
 
@@ -114,5 +114,4 @@ Odysseus/
 
 ## Dataset
 
-**HM3D minival** — 10 scenes, free academic licence.  
-Scene path auto-detected: `/root/autodl-tmp/data/hm3d` (autodl) or `/data3/liangjy/vln/data/hm3d` (local).
+**HM3D minival** — 10 scenes, free academic licence.

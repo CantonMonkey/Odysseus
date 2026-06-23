@@ -44,7 +44,7 @@ IMG_W        = 640
 FORWARD_STEP = 0.25   # metres per move_forward step
 TURN_DEG     = 15.0   # degrees per turn step
 
-DATA_DIR = Path(os.environ.get("VLN_DATA_DIR", "/data3/liangjy/vln/data/hm3d"))
+DATA_DIR = Path(os.environ.get("VLN_DATA_DIR", "/root/autodl-tmp/data/hm3d"))
 
 # Per-robot kinematic + sensor specs.
 # "fetch" values match the real Fetch robot used in Habitat benchmarks:

@@ -42,7 +42,7 @@ IGNORE_CATEGORIES = {
     "wall hanging decoration", "stairs", "vent", "ventilation",
 }
 
-DATA_DIR = Path(os.environ.get("VLN_DATA_DIR", "/data3/liangjy/vln/data/hm3d"))
+DATA_DIR = Path(os.environ.get("VLN_DATA_DIR", "/root/autodl-tmp/data/hm3d"))
 
 
 def _parse_semantic_txt(scene_dir: Path) -> dict:

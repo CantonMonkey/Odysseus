@@ -100,8 +100,7 @@ def main():
 
     # Resolve scene dir
     from pathlib import Path as P
-    _default = P("/root/autodl-tmp/data/hm3d") if P("/root/autodl-tmp/data/hm3d").exists() \
-               else P("/data3/liangjy/vln/data/hm3d")
+    _default = P("/root/autodl-tmp/data/hm3d")
     scene_dir = str(P(os.environ.get("VLN_DATA_DIR", str(_default))) / "00800-TEEsavR23oF")
 
     from eval import run_evaluation, _load_all_instances, _run_chain_episode, \
