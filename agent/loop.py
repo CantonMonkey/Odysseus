@@ -460,6 +460,11 @@ def run_task(
             _log(f"  [STREAK-TRIGGER step={step}] streak={_cstrk_cur} "
                  f"score={_clip_sc_cur:.2f} → forcing immediate VLM re-eval")
             nav_state["vlm_step"] = step - VLM_CALL_INTERVAL  # force trigger next block
+            if on_thought:
+                _sd = _clip_res.get("direction", "?")
+                on_thought(step, "sensor",
+                           f"CLIP传感器: 连续{_cstrk_cur}帧检测到目标 "
+                           f"(score={_clip_sc_cur:.2f}, dir={_sd}) → 唤醒VLM确认")
         nav_state["clip_streak_prev"] = _cstrk_cur
 
         # ── VLFM-style VLM call ────────────────────────────────────────
@@ -766,7 +771,8 @@ def run_task(
                     if _sd and _sd not in ("none", "") and not percept.get("target_visible", False):
                         _dist_hint += f" → {_sd}"
                     if on_thought and _r_clean not in _skip and len(_r_clean) >= 12:
-                        on_thought(step, _skill, _r_clean + _dist_hint)
+                        on_thought(step, _skill, _r_clean + _dist_hint,
+                                   percept.get("room"))
                     _dh = nav_state.setdefault("decision_history", [])
                     _dh.append({"step": step, "skill": _skill, "reason": _r_clean[:60], "room": percept.get("room", "other")})
                     if len(_dh) > 3:
@@ -1034,6 +1040,9 @@ def run_task(
                 if _bvd < 1.5:
                     _log(f"  [VALUE-STOP step={step}] dist_to_best_cell={_bvd:.2f}m CLIP={_clip_sc_vm:.2f} → done")
                     nav_state["done"] = True
+                    if on_thought:
+                        on_thought(step, "verify",
+                                   f"到达目标区域 (热力图最高点距离{_bvd:.2f}m, CLIP={_clip_sc_vm:.2f}) → 停止")
 
         # ── Stagnation / ESCAPE ────────────────────────────────────────
         if current_skill == "explore_frontier":

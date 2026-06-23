@@ -99,11 +99,14 @@ def _habitat_worker():
                         map_png = _map_to_png(_live_map, robot_pose)
                         _frame_q.put(("map", map_png, state))
 
-            def on_thought(step, skill, reason):
-                _frame_q.put(("thought", None, {
+            def on_thought(step, skill, reason, room=None):
+                payload = {
                     "status": "navigating", "goal": goal,
                     "step": step, "skill": skill, "reason": reason,
-                }))
+                }
+                if room:
+                    payload["room"] = room
+                _frame_q.put(("thought", None, payload))
 
             result = run_task(env, goal, scene_dir=SCENE_DIR, on_frame=on_frame,
                               llm_perceive=llm_perceive,
