@@ -407,8 +407,10 @@ def _run_chain_episode(
             denom   = max(L_star, p_seg)
             spl     = (float(success) * L_star / denom) if denom > 0 else 0.0
 
+            soft_success = max(0.0, (SUCCESS_DIST - dist) / SUCCESS_DIST)
+            soft_spl = (soft_success * L_star / denom) if denom > 0 else 0.0
             ep_r = {
-                "success": success, "spl": spl,
+                "success": success, "spl": spl, "soft_spl": soft_spl,
                 "dist_to_nearest": dist, "path_length": p_seg,
                 "geodesic_dist": L_star, "steps": result.get("step_count", 0),
                 "goal": goal, "episode": episode_idx, "chain_idx": gi,
