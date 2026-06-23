@@ -184,9 +184,33 @@ def _explore_frontier(env, nav_state: dict, explore_map: ExploreMap,
         target = None
         failed = nav_state.get("failed_frontiers", set())
 
+        step = nav_state["step_count"]
+
+        # ── 策略阶段引导 (大脑计划 → 小脑执行) ─────────────────────────────
+        _phases      = nav_state.get("search_strategy", [])
+        _phase_idx   = nav_state.get("strategy_phase", 0)
+        _phase_room  = _phases[_phase_idx] if _phase_idx < len(_phases) else None
+
+        if _phase_room:
+            _room_visits = nav_state.get("room_counts", {}).get(_phase_room, 0)
+            if _room_visits >= 4:
+                nav_state["strategy_phase"] = _phase_idx + 1
+                _phase_idx  = nav_state["strategy_phase"]
+                _phase_room = _phases[_phase_idx] if _phase_idx < len(_phases) else None
+                _on_thought = nav_state.get("_on_thought")
+                if _phase_room and _on_thought:
+                    _on_thought(step, "plan", f"阶段推进 → 搜索 {_phase_room}")
+                _log(f"  [STRATEGY step={step}] phase advanced → {_phase_room}")
+
         hint = topo_map.suggest_goal_direction(task, robot_pos)
         action_type = hint.get("action", "explore")
-        step = nav_state["step_count"]
+
+        if _phase_room and action_type == "explore":
+            _phase_node = topo_map.find_room_node(_phase_room)
+            if _phase_node is not None:
+                hint = {"action": "goto", "pos": _phase_node.pos}
+                action_type = "goto"
+                _log(f"  [STRATEGY step={step}] phase={_phase_room} → goto known node ({_phase_node.pos[0]:.1f},{_phase_node.pos[2]:.1f})")
 
         if action_type == "goto":
             target = hint["pos"]
@@ -361,6 +385,10 @@ def run_task(
         "room_counts":    {},        # Phase 4: room visit counts for VLM context
         "room_vlm_history": [],     # last 8 VLM-reported room labels (loop detection)
         "step_log":       [],        # Structured per-VLM-call log (exported as JSON)
+        "search_strategy":  [],      # 大脑先验推理: ordered room search phases
+        "strategy_phase":   0,       # current phase index
+        "strategy_floor":   0,       # 0=ground first, 1=upper first
+        "_on_thought":      on_thought,  # callback for _explore_frontier phase transitions
         # Decision chain stats (accumulated per episode)
         "_stats": {
             "vlm_calls": 0, "vlm_visible": 0, "snap_events": 0,
@@ -373,6 +401,17 @@ def run_task(
     robot_pos, _ = env.get_robot_pose()
     _log(f"  [EPISODE START] goal={task} robot=({robot_pos[0]:.2f},{robot_pos[2]:.2f}) "
          f"instances={len(instances)}")
+
+    # ── Episode-start VLM strategy planning (大脑先验推理) ──────────────────
+    if llm_perceive is not None:
+        from agent.llm_agent import plan_strategy as _plan_strategy
+        _strategy = _plan_strategy(task)
+        nav_state["search_strategy"] = _strategy.get("phase_rooms", [])
+        nav_state["strategy_phase"]  = 0
+        nav_state["strategy_floor"]  = _strategy.get("floor", 0)
+        if on_thought and nav_state["search_strategy"]:
+            _sr = nav_state["search_strategy"]
+            on_thought(0, "plan", f"搜索策略: {' → '.join(_sr)} | {_strategy.get('reasoning', '')}")
 
     if on_frame:
         on_frame(nav_state["last_frame"], nav_state)
@@ -491,6 +530,8 @@ def run_task(
                     "nearest_dist_str": f"{_idist_ctx:.1f}m" if _idist_ctx else "unknown",
                     "history":          nav_state.get("decision_history", []),
                     "topo_summary":     topo_map.summary(),
+                    "search_strategy":  nav_state.get("search_strategy", []),
+                    "strategy_phase":   nav_state.get("strategy_phase", 0),
                 }
                 # CLIP state injected into VLM prompt so large brain knows what
                 # the small brain sensor is detecting (dual-loop coupling).

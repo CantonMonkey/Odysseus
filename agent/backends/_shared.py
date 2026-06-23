@@ -55,8 +55,18 @@ def _build_perceive_prompt(goal: str, n_waypoints: int = 0, context: dict = None
                 )
 
     if context:
+        _strategy_line = ""
+        if context.get("search_strategy"):
+            _phases = context["search_strategy"]
+            _pidx   = context.get("strategy_phase", 0)
+            _pcur   = _phases[_pidx] if _pidx < len(_phases) else "done"
+            _strategy_line = (
+                f"Search plan: {' → '.join(_phases)} | "
+                f"Current phase: {_pcur} (phase {_pidx+1}/{len(_phases)})\n"
+            )
         ctx_str = (
-            f"Navigation state: step {context.get('step', 0)}/{context.get('max_steps', 500)}"
+            _strategy_line
+            + f"Navigation state: step {context.get('step', 0)}/{context.get('max_steps', 500)}"
             f" | explored {context.get('explored_pct', 0):.0%}"
             f" | stagnant {context.get('stagnant_steps', 0)} steps\n"
             f"Rooms seen: {context.get('rooms_str', 'none yet')}\n"
@@ -178,3 +188,49 @@ def _rule_fallback(goal: str) -> dict:
         "target_visible": False, "direction": "not_visible", "distance": 99.0,
         "confidence": 0.0, "room": "other", "relevance": 0.2,
     }
+
+
+# ── Episode-start strategy planning ──────────────────────────────────────────
+
+_STRATEGY_FLOOR_HINTS = {
+    "冰箱": "ground floor only — kitchens are never upstairs",
+    "床":   "upper floor preferred — bedrooms are often upstairs",
+    "沙发": "ground floor — living room is almost always on ground floor",
+    "电视": "ground floor preferred, may be in upstairs bedroom",
+    "桌子": "ground floor preferred (kitchen/dining)",
+    "椅子": "ground floor preferred (kitchen/dining/living room)",
+    "厕所": "ground floor preferred, some homes have upstairs bathroom",
+    "水槽": "ground floor (kitchen/bathroom)",
+}
+
+_STRATEGY_ROOM_ORDER = {
+    "冰箱": ["kitchen", "hallway", "living_room"],
+    "床":   ["bedroom", "hallway", "staircase"],
+    "沙发": ["living_room", "hallway", "bedroom"],
+    "电视": ["living_room", "bedroom", "hallway"],
+    "桌子": ["kitchen", "living_room", "hallway"],
+    "椅子": ["kitchen", "living_room", "hallway"],
+    "厕所": ["bathroom", "hallway", "bedroom"],
+    "水槽": ["bathroom", "kitchen", "hallway"],
+}
+
+
+def _build_strategy_prompt(goal: str) -> str:
+    """Text-only prompt for episode-start search strategy planning (no image)."""
+    _floor = _STRATEGY_FLOOR_HINTS.get(goal, "use common sense about which floor")
+    _example_rooms = _STRATEGY_ROOM_ORDER.get(goal, ["hallway", "living_room", "bedroom"])
+    _example = json.dumps({"phase_rooms": _example_rooms, "floor": 0,
+                           "reasoning": f"{goal} is typically found in {_example_rooms[0]}"})
+    return (
+        f"You are planning a home navigation search strategy to find '{goal}'.\n"
+        f"No visual information yet — use commonsense knowledge only.\n"
+        f"Floor guidance: {_floor}\n"
+        f"Task: Output a search plan as ONE JSON line, no other text.\n"
+        f'{{"phase_rooms":["room1","room2","room3"],"floor":int,"reasoning":"one sentence"}}\n'
+        f"Rules:\n"
+        f"- phase_rooms: ordered list of 2-4 room types to search, most likely FIRST\n"
+        f"- room options: living_room|bedroom|kitchen|hallway|bathroom|staircase\n"
+        f"- floor: 0=search ground floor first, 1=search upper floor first\n"
+        f"- reasoning: one short sentence explaining the strategy\n"
+        f"Example for '{goal}': {_example}"
+    )
