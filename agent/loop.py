@@ -444,24 +444,31 @@ def run_task(
                     _log(f"  [CLIP step={step}] score={_clip_res['score']:.2f} → streak reset")
                 nav_state["clip_streak"] = 0
 
-        # ── CLIP-streak stop ───────────────────────────────────────────
-        # 5+ consecutive high-CLIP frames = object is continuously visible
-        # right in front of the robot. Stop now — no SNAP→follow_path→verify
-        # chain needed. This fires even when bbox depth fails (the common case
-        # in visual-only mode) and when the VLM hasn't called recently.
+        # ── CLIP-streak trigger ────────────────────────────────────────
+        # When CLIP has seen the target for 5+ consecutive frames, force an
+        # immediate VLM re-evaluation so the large brain makes the stop decision
+        # with CLIP evidence — rather than the small brain stopping alone.
         _cstrk_cur = nav_state.get("clip_streak", 0)
         _clip_sc_cur = _clip_res.get("score", 0.0)
+        _cstrk_prev = nav_state.get("clip_streak_prev", 0)
         if (step >= 20
                 and not nav_state.get("done", False)
                 and nav_state.get("current_skill") not in ("verify_arrival", "done")
                 and _cstrk_cur >= 5
-                and _clip_sc_cur > 0.42):
-            _log(f"  [STREAK-STOP step={step}] streak={_cstrk_cur} "
-                 f"score={_clip_sc_cur:.2f} → done")
-            nav_state["done"] = True
+                and _clip_sc_cur > 0.42
+                and _cstrk_prev < 5):
+            _log(f"  [STREAK-TRIGGER step={step}] streak={_cstrk_cur} "
+                 f"score={_clip_sc_cur:.2f} → forcing immediate VLM re-eval")
+            nav_state["vlm_step"] = step - VLM_CALL_INTERVAL  # force trigger next block
+        nav_state["clip_streak_prev"] = _cstrk_cur
 
         # ── VLFM-style VLM call ────────────────────────────────────────
-        if llm_perceive is not None and (step - nav_state["vlm_step"]) >= VLM_CALL_INTERVAL:
+        # Trigger every VLM_CALL_INTERVAL steps, OR immediately when CLIP
+        # streak first reaches threshold (STREAK-TRIGGER above resets vlm_step).
+        _clip_event = (_cstrk_cur >= 3 and _cstrk_prev < 3)
+        if llm_perceive is not None and (
+            (step - nav_state["vlm_step"]) >= VLM_CALL_INTERVAL or _clip_event
+        ):
             try:
                 # Phase 4: build context dict for VLM brain
                 _idist_ctx = _inst_dist(robot_pos, instances)
@@ -479,6 +486,13 @@ def run_task(
                     "nearest_dist_str": f"{_idist_ctx:.1f}m" if _idist_ctx else "unknown",
                     "history":          nav_state.get("decision_history", []),
                     "topo_summary":     topo_map.summary(),
+                }
+                # CLIP state injected into VLM prompt so large brain knows what
+                # the small brain sensor is detecting (dual-loop coupling).
+                _clip_state_for_vlm = {
+                    "streak":    nav_state.get("clip_streak", 0),
+                    "score":     nav_state.get("last_clip", {}).get("score", 0.0),
+                    "direction": nav_state.get("last_clip", {}).get("direction", "none"),
                 }
 
                 # Always annotate frontiers (AgentVLN: unified cross-space mapping)
@@ -498,7 +512,8 @@ def run_task(
                     percept = llm_perceive(_ann, task,
                                            annotated_frame=_ann,
                                            n_waypoints=len(_visible),
-                                           context=_ctx)
+                                           context=_ctx,
+                                           clip_state=_clip_state_for_vlm)
                     if nav_state.get("target_pos") is None and nav_state.get("frontier_pos") is None:
                         _choice = percept.get("waypoint", 0)
                         if 1 <= _choice <= len(_visible):
@@ -510,7 +525,8 @@ def run_task(
                             _log(f"  [VLM-FRONTIER step={step}] chose waypoint {_choice} "
                                  f"\u2192 ({_chosen[0]:.1f},{_chosen[2]:.1f})")
                 else:
-                    percept = llm_perceive(nav_state["last_frame"], task, context=_ctx)
+                    percept = llm_perceive(nav_state["last_frame"], task, context=_ctx,
+                                           clip_state=_clip_state_for_vlm)
 
                 # Merge CLIP detection into percept: CLIP handles vis/bbox, VLM handles room/skill.
                 # Skip during verify_arrival scan so the confidence window reflects

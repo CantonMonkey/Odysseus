@@ -19,7 +19,7 @@ class VLLMBackend:
             os.path.basename(_local) if _local else "InternVL3-8B",
         )
 
-    def perceive(self, frame, goal, annotated_frame=None, n_waypoints=0, context=None) -> dict:
+    def perceive(self, frame, goal, annotated_frame=None, n_waypoints=0, context=None, clip_state=None) -> dict:
         from agent.backends.rule_based import RuleBasedBackend
         use_frame = annotated_frame if annotated_frame is not None else frame
         b64 = _frame_to_jpeg_b64(use_frame)
@@ -27,7 +27,7 @@ class VLLMBackend:
             "model": self.model,
             "messages": [{"role": "user", "content": [
                 {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
-                {"type": "text", "text": _build_perceive_prompt(goal, n_waypoints, context)},
+                {"type": "text", "text": _build_perceive_prompt(goal, n_waypoints, context, clip_state)},
             ]}],
             "max_tokens": 256,
             "temperature": 0.0,

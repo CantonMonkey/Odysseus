@@ -85,7 +85,7 @@ class InternVL3Backend:
             print(f"[InternVL3] Load failed: {e}", flush=True)
         return cls._model, cls._tokenizer
 
-    def perceive(self, frame, goal, annotated_frame=None, n_waypoints=0, context=None) -> dict:
+    def perceive(self, frame, goal, annotated_frame=None, n_waypoints=0, context=None, clip_state=None) -> dict:
         from agent.backends.rule_based import RuleBasedBackend
         from PIL import Image
         model, tokenizer = self._load()
@@ -94,7 +94,7 @@ class InternVL3Backend:
         use_frame = annotated_frame if annotated_frame is not None else frame
         pil = Image.fromarray(use_frame.astype(np.uint8))
         pixel_values = _internvl_pixel_values(pil, max_num=4)
-        prompt = "<image>\n" + _build_perceive_prompt(goal, n_waypoints, context)
+        prompt = "<image>\n" + _build_perceive_prompt(goal, n_waypoints, context, clip_state)
         try:
             import torch
             text = model.chat(tokenizer, pixel_values, prompt,

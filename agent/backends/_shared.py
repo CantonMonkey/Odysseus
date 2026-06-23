@@ -20,7 +20,7 @@ def _frame_to_jpeg_b64(frame: np.ndarray) -> str:
     return base64.b64encode(buf.tobytes()).decode()
 
 
-def _build_perceive_prompt(goal: str, n_waypoints: int = 0, context: dict = None) -> str:
+def _build_perceive_prompt(goal: str, n_waypoints: int = 0, context: dict = None, clip_state: dict = None) -> str:
     """Build the text portion of the VLM perception prompt."""
     if n_waypoints >= 2:
         waypoint_rule = (
@@ -115,8 +115,19 @@ def _build_perceive_prompt(goal: str, n_waypoints: int = 0, context: dict = None
         '{"direction":"not_visible","confidence":0.0,"room":"hallway","relevance":0.3,"search_direction":"left"'
         + _ex_wp + _ex_sk_n + "}"
     )
+    _clip_alert = ""
+    if clip_state and clip_state.get("streak", 0) >= 2:
+        _clip_alert = (
+            f"SENSOR ALERT: Low-level CLIP detector has seen '{goal}' for "
+            f"{clip_state['streak']} consecutive frames "
+            f"(confidence={clip_state['score']:.2f}, direction={clip_state['direction']}). "
+            f"This is a strong signal from the sensor. If you also see '{goal}' in the image, "
+            f"you MUST output skill=snap immediately.\n"
+        )
+
     return (
         f"You are a home navigation robot brain. Navigation goal: {goal}\n"
+        + _clip_alert
         + ctx_str
         + "Observe the entire image carefully. Return ONE JSON line, no other text.\n"
         + "REQUIRED JSON:\n"

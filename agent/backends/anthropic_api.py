@@ -41,7 +41,7 @@ def _frame_to_b64(frame) -> str:
 class AnthropicBackend:
     """Anthropic (or Anthropic-compatible) API backend."""
 
-    def perceive(self, frame, goal, annotated_frame=None, n_waypoints=0, context=None) -> dict:
+    def perceive(self, frame, goal, annotated_frame=None, n_waypoints=0, context=None, clip_state=None) -> dict:
         from agent.backends.rule_based import RuleBasedBackend
         client = _get_client()
         if client is None:

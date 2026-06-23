@@ -23,7 +23,7 @@ _KEYWORD_MAP = {
 class RuleBasedBackend:
     """Always returns target_not_visible; parse_goal uses keyword matching."""
 
-    def perceive(self, frame, goal, annotated_frame=None, n_waypoints=0, context=None) -> dict:
+    def perceive(self, frame, goal, annotated_frame=None, n_waypoints=0, context=None, clip_state=None) -> dict:
         return _rule_fallback(goal)
 
     def parse_goal(self, user_input: str) -> "str | None":
