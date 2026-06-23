@@ -984,6 +984,7 @@ def run_task(
 
             except Exception as e:
                 _log(f"  [VLM ERROR step={step}] {e}")
+                nav_state["vlm_step"] = step  # prevent retry storm on persistent error
 
         # ── Update value map ───────────────────────────────────────────
         vlm_score = float(nav_state["last_percept"].get("relevance", 0.2))

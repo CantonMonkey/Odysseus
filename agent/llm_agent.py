@@ -35,18 +35,19 @@ _rule_backend  = RuleBasedBackend()
 def perceive(frame, goal: str,
              annotated_frame=None,
              n_waypoints: int = 0,
-             context: dict = None) -> dict:
+             context: dict = None,
+             clip_state: dict = None) -> dict:
     """Analyse the current RGB frame with a VLM.
 
     Priority: vLLM server -> InternVL3 local -> Anthropic API -> rule-based.
     """
     if _vllm_backend is not None:
-        return _vllm_backend.perceive(frame, goal, annotated_frame, n_waypoints, context)
+        return _vllm_backend.perceive(frame, goal, annotated_frame, n_waypoints, context, clip_state)
     if _local_backend is not None:
-        return _local_backend.perceive(frame, goal, annotated_frame, n_waypoints, context)
+        return _local_backend.perceive(frame, goal, annotated_frame, n_waypoints, context, clip_state)
     client = _get_client()
     if client is not None:
-        return _api_backend.perceive(frame, goal, annotated_frame, n_waypoints, context)
+        return _api_backend.perceive(frame, goal, annotated_frame, n_waypoints, context, clip_state)
     return _rule_backend.perceive(frame, goal)
 
 
