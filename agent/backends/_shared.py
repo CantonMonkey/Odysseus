@@ -173,6 +173,7 @@ def _parse_percept_json(text: str, goal: str) -> dict:
     try:
         js, je = text.rfind("{"), text.rfind("}") + 1
         result = json.loads(text[js:je])
+        result["_raw"] = text[js:je]  # pass raw JSON up for frontend display
         # Only zero-out confidence/direction when target_visible is EXPLICITLY false.
         # If the field is absent (new schema without target_visible), preserve VLM signals.
         if "target_visible" in result and not result["target_visible"]:

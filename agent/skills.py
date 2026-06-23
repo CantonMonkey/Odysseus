@@ -272,7 +272,7 @@ def verify_arrival(env, nav_state: dict) -> dict:
         CONF_WINDOW = 6   # ~90° rotation
         # Lowered from 0.45: beds/fridges reach ~0.44 rescaled, old threshold
         # was just out of reach causing consistent scan failure.
-        CONF_THRESH = 0.30
+        CONF_THRESH = 0.40  # raised from 0.30 — white walls average ~0.30
         window = nav_state.get("verify_conf_window", [])
         window.append(_clip_v)
         window = window[-CONF_WINDOW:]

@@ -574,6 +574,12 @@ def run_task(
                     percept = llm_perceive(nav_state["last_frame"], task, context=_ctx,
                                            clip_state=_clip_state_for_vlm)
 
+                # Emit raw VLM JSON to frontend before any merging so the user
+                # can see exactly what the model returned each call.
+                _vlm_raw = percept.pop("_raw", None)
+                if _vlm_raw and on_thought:
+                    on_thought(step, "vlm_raw", _vlm_raw[:280])
+
                 # Merge CLIP detection into percept: CLIP handles vis/bbox, VLM handles room/skill.
                 # Skip during verify_arrival scan so the confidence window reflects
                 # only VLM's own judgment, not CLIP injection.
@@ -651,7 +657,8 @@ def run_task(
                 if _in_follow and vis:
                     _log(f"  [VLM decision] in follow_path → routing skipped (skill autonomy)")
 
-                if vis and not _in_verify and not _in_servo and not _in_follow:
+                if (vis and not _in_verify and not _in_servo and not _in_follow
+                        and rel >= 0.40 and room != "other"):
                     depth = env.get_depth()
                     tgt   = _estimate_target_pos(
                         depth, direction, robot_pos, R)
