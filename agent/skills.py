@@ -235,6 +235,14 @@ def verify_arrival(env, nav_state: dict) -> dict:
     instances      = nav_state.get("target_instances", [])
     _conf = float(percept.get("confidence", 0.0))
 
+    # Instant success if CLIP is already very high at verify entry — no scan needed.
+    _entry_clip = nav_state.get("last_clip", {}).get("score", 0.0)
+    if _entry_clip > 0.55:
+        print(f"  [VERIFY INSTANT step={step}] CLIP={_entry_clip:.2f} > 0.55 at entry → done", flush=True)
+        nav_state["done"]          = True
+        nav_state["current_skill"] = "done"
+        return nav_state
+
     # Accept up to 2.5m on entry: follow_path hands off at 1.2m but a final
     # forward step can overshoot slightly, causing immediate dist > ARRIVE_DIST
     # bounce → follow_path stagnation → explore (2-step false escape).
@@ -282,9 +290,9 @@ def verify_arrival(env, nav_state: dict) -> dict:
         nav_state["verify_best_clip"] = max(nav_state.get("verify_best_clip", 0.0), _clip_v)
 
         # Early exit: two consecutive high-CLIP frames → done
-        # Lowered from 0.45: rescaled 0.38 = raw cosim 0.254 (clearly visible)
+        # Threshold 0.35: raw cosim ~0.245, visible at close range
         _vstreak = nav_state.get("verify_clip_streak", 0)
-        if _clip_v > 0.38:
+        if _clip_v > 0.35:
             _vstreak += 1
         else:
             _vstreak = 0

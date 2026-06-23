@@ -811,6 +811,17 @@ def run_task(
                     _sd = percept.get("search_direction", "")
                     if _sd and _sd not in ("none", "") and not percept.get("target_visible", False):
                         _dist_hint += f" → {_sd}"
+
+                    # Use VLM search_direction="upstairs" to break the staircase
+                    # sighting catch-22: VLM can see stairs before the robot
+                    # physically reaches them, so record current pos as sighting.
+                    if (_sd == "upstairs"
+                            and nav_state.get("staircase_sighting") is None):
+                        nav_state["staircase_sighting"] = robot_pos.tolist()
+                        _log(f"  [STAIRCASE step={step}] VLM search_direction=upstairs"
+                             f" → sighting at ({robot_pos[0]:.1f},{robot_pos[2]:.1f})")
+                        if on_thought:
+                            on_thought(step, "plan", "Staircase spotted → recorded position, ready to ascend")
                     if on_thought and _r_clean not in _skip and len(_r_clean) >= 12:
                         on_thought(step, _skill, _r_clean + _dist_hint,
                                    percept.get("room"))
@@ -1064,27 +1075,36 @@ def run_task(
         explore_map.update(robot_pos, R, vlm_score, direction=_vmap_dir)
 
         # ── VLFM proximity stop ────────────────────────────────────────
-        # CLIP > 0.50 (raw cosim ~0.26, clearly visible) AND either:
-        #   - VLM recently confirmed visible (target_visible in last_percept), OR
-        #   - CLIP streak >= 3 (3 consecutive high frames, no VLM call needed)
-        # The streak gate fixes cases where VLM fires every 8 steps and the
-        # 7-step gap between calls leaves _vlm_vis_vm stale at False.
+        # Requires BOTH: CLIP > 0.50 AND explicit VLM visual confirmation.
+        # The former clip_streak>=3 independent gate caused false positives:
+        # white cabinets / door frames score high for 冰箱/衣柜, causing the
+        # robot to stop in the wrong room. STREAK-TRIGGER already wakes the VLM
+        # when streak>=5, so VLM confirmation is available when it matters.
         _vlm_vis_vm = nav_state.get("last_percept", {}).get("target_visible", False)
+        # Room-type sanity gate: block VALUE-STOP when clearly in the wrong room.
+        _WRONG_ROOM_BLOCK = {
+            "冰箱": {"bedroom", "bathroom", "staircase"},
+            "衣柜": {"kitchen", "bathroom", "staircase"},
+            "床":   {"kitchen", "bathroom", "staircase"},
+        }
+        _cur_room_vm  = nav_state.get("last_percept", {}).get("room", "other")
+        _room_blocked = _cur_room_vm in _WRONG_ROOM_BLOCK.get(task, set())
         if (step >= 50
                 and not nav_state.get("done", False)
                 and nav_state.get("current_skill") not in ("verify_arrival", "done")
                 and _clip_sc_vm > 0.50
-                and (_vlm_vis_vm or nav_state.get("clip_streak", 0) >= 3)):
+                and _vlm_vis_vm
+                and not _room_blocked):
             _bvp = explore_map.best_value_pos(robot_pos)
             if _bvp is not None:
                 _bvd = float(np.sqrt(
                     (robot_pos[0] - _bvp[0])**2 + (robot_pos[2] - _bvp[2])**2))
                 if _bvd < 1.5:
-                    _log(f"  [VALUE-STOP step={step}] dist_to_best_cell={_bvd:.2f}m CLIP={_clip_sc_vm:.2f} → done")
+                    _log(f"  [VALUE-STOP step={step}] dist_to_best_cell={_bvd:.2f}m CLIP={_clip_sc_vm:.2f} room={_cur_room_vm} → done")
                     nav_state["done"] = True
                     if on_thought:
                         on_thought(step, "verify",
-                                   f"到达目标区域 (热力图最高点距离{_bvd:.2f}m, CLIP={_clip_sc_vm:.2f}) → 停止")
+                                   f"Reached target zone (heatmap peak {_bvd:.2f}m, CLIP={_clip_sc_vm:.2f}) → stop")
 
         # ── Stagnation / ESCAPE ────────────────────────────────────────
         if current_skill == "explore_frontier":
