@@ -184,9 +184,33 @@ def _explore_frontier(env, nav_state: dict, explore_map: ExploreMap,
         target = None
         failed = nav_state.get("failed_frontiers", set())
 
+        step = nav_state["step_count"]
+
+        # ── 策略阶段引导 (大脑计划 → 小脑执行) ─────────────────────────────
+        _phases      = nav_state.get("search_strategy", [])
+        _phase_idx   = nav_state.get("strategy_phase", 0)
+        _phase_room  = _phases[_phase_idx] if _phase_idx < len(_phases) else None
+
+        if _phase_room:
+            _room_visits = nav_state.get("room_counts", {}).get(_phase_room, 0)
+            if _room_visits >= 4:
+                nav_state["strategy_phase"] = _phase_idx + 1
+                _phase_idx  = nav_state["strategy_phase"]
+                _phase_room = _phases[_phase_idx] if _phase_idx < len(_phases) else None
+                _on_thought = nav_state.get("_on_thought")
+                if _phase_room and _on_thought:
+                    _on_thought(step, "plan", f"阶段推进 → 搜索 {_phase_room}")
+                _log(f"  [STRATEGY step={step}] phase advanced → {_phase_room}")
+
         hint = topo_map.suggest_goal_direction(task, robot_pos)
         action_type = hint.get("action", "explore")
-        step = nav_state["step_count"]
+
+        if _phase_room and action_type == "explore":
+            _phase_node = topo_map.find_room_node(_phase_room)
+            if _phase_node is not None:
+                hint = {"action": "goto", "pos": _phase_node.pos}
+                action_type = "goto"
+                _log(f"  [STRATEGY step={step}] phase={_phase_room} → goto known node ({_phase_node.pos[0]:.1f},{_phase_node.pos[2]:.1f})")
 
         if action_type == "goto":
             target = hint["pos"]
@@ -361,6 +385,10 @@ def run_task(
         "room_counts":    {},        # Phase 4: room visit counts for VLM context
         "room_vlm_history": [],     # last 8 VLM-reported room labels (loop detection)
         "step_log":       [],        # Structured per-VLM-call log (exported as JSON)
+        "search_strategy":  [],      # 大脑先验推理: ordered room search phases
+        "strategy_phase":   0,       # current phase index
+        "strategy_floor":   0,       # 0=ground first, 1=upper first
+        "_on_thought":      on_thought,  # callback for _explore_frontier phase transitions
         # Decision chain stats (accumulated per episode)
         "_stats": {
             "vlm_calls": 0, "vlm_visible": 0, "snap_events": 0,
@@ -373,6 +401,17 @@ def run_task(
     robot_pos, _ = env.get_robot_pose()
     _log(f"  [EPISODE START] goal={task} robot=({robot_pos[0]:.2f},{robot_pos[2]:.2f}) "
          f"instances={len(instances)}")
+
+    # ── Episode-start VLM strategy planning (大脑先验推理) ──────────────────
+    if llm_perceive is not None:
+        from agent.llm_agent import plan_strategy as _plan_strategy
+        _strategy = _plan_strategy(task)
+        nav_state["search_strategy"] = _strategy.get("phase_rooms", [])
+        nav_state["strategy_phase"]  = 0
+        nav_state["strategy_floor"]  = _strategy.get("floor", 0)
+        if on_thought and nav_state["search_strategy"]:
+            _sr = nav_state["search_strategy"]
+            on_thought(0, "plan", f"搜索策略: {' → '.join(_sr)} | {_strategy.get('reasoning', '')}")
 
     if on_frame:
         on_frame(nav_state["last_frame"], nav_state)
@@ -439,15 +478,41 @@ def run_task(
                 nav_state["clip_streak"] = _cstrk
                 _log(f"  [CLIP step={step}] score={_clip_res['score']:.2f} "
                      f"streak={_cstrk} dir={_clip_res['direction']}")
-                # CLIP provides vis signal only; SNAP is handled by Phase 3 VLM path
-                # (CLIP's 4×3 patch bbox is too coarse for reliable 3D localization)
             else:
                 if nav_state.get("clip_streak", 0) > 0:
                     _log(f"  [CLIP step={step}] score={_clip_res['score']:.2f} → streak reset")
                 nav_state["clip_streak"] = 0
 
+        # ── CLIP-streak trigger ────────────────────────────────────────
+        # When CLIP has seen the target for 5+ consecutive frames, force an
+        # immediate VLM re-evaluation so the large brain makes the stop decision
+        # with CLIP evidence — rather than the small brain stopping alone.
+        _cstrk_cur = nav_state.get("clip_streak", 0)
+        _clip_sc_cur = _clip_res.get("score", 0.0)
+        _cstrk_prev = nav_state.get("clip_streak_prev", 0)
+        if (step >= 20
+                and not nav_state.get("done", False)
+                and nav_state.get("current_skill") not in ("verify_arrival", "done")
+                and _cstrk_cur >= 5
+                and _clip_sc_cur > 0.42
+                and _cstrk_prev < 5):
+            _log(f"  [STREAK-TRIGGER step={step}] streak={_cstrk_cur} "
+                 f"score={_clip_sc_cur:.2f} → forcing immediate VLM re-eval")
+            nav_state["vlm_step"] = step - VLM_CALL_INTERVAL  # force trigger next block
+            if on_thought:
+                _sd = _clip_res.get("direction", "?")
+                on_thought(step, "sensor",
+                           f"CLIP传感器: 连续{_cstrk_cur}帧检测到目标 "
+                           f"(score={_clip_sc_cur:.2f}, dir={_sd}) → 唤醒VLM确认")
+        nav_state["clip_streak_prev"] = _cstrk_cur
+
         # ── VLFM-style VLM call ────────────────────────────────────────
-        if llm_perceive is not None and (step - nav_state["vlm_step"]) >= VLM_CALL_INTERVAL:
+        # Trigger every VLM_CALL_INTERVAL steps, OR immediately when CLIP
+        # streak first reaches threshold (STREAK-TRIGGER above resets vlm_step).
+        _clip_event = (_cstrk_cur >= 3 and _cstrk_prev < 3)
+        if llm_perceive is not None and (
+            (step - nav_state["vlm_step"]) >= VLM_CALL_INTERVAL or _clip_event
+        ):
             try:
                 # Phase 4: build context dict for VLM brain
                 _idist_ctx = _inst_dist(robot_pos, instances)
@@ -465,6 +530,15 @@ def run_task(
                     "nearest_dist_str": f"{_idist_ctx:.1f}m" if _idist_ctx else "unknown",
                     "history":          nav_state.get("decision_history", []),
                     "topo_summary":     topo_map.summary(),
+                    "search_strategy":  nav_state.get("search_strategy", []),
+                    "strategy_phase":   nav_state.get("strategy_phase", 0),
+                }
+                # CLIP state injected into VLM prompt so large brain knows what
+                # the small brain sensor is detecting (dual-loop coupling).
+                _clip_state_for_vlm = {
+                    "streak":    nav_state.get("clip_streak", 0),
+                    "score":     nav_state.get("last_clip", {}).get("score", 0.0),
+                    "direction": nav_state.get("last_clip", {}).get("direction", "none"),
                 }
 
                 # Always annotate frontiers (AgentVLN: unified cross-space mapping)
@@ -484,7 +558,8 @@ def run_task(
                     percept = llm_perceive(_ann, task,
                                            annotated_frame=_ann,
                                            n_waypoints=len(_visible),
-                                           context=_ctx)
+                                           context=_ctx,
+                                           clip_state=_clip_state_for_vlm)
                     if nav_state.get("target_pos") is None and nav_state.get("frontier_pos") is None:
                         _choice = percept.get("waypoint", 0)
                         if 1 <= _choice <= len(_visible):
@@ -496,7 +571,14 @@ def run_task(
                             _log(f"  [VLM-FRONTIER step={step}] chose waypoint {_choice} "
                                  f"\u2192 ({_chosen[0]:.1f},{_chosen[2]:.1f})")
                 else:
-                    percept = llm_perceive(nav_state["last_frame"], task, context=_ctx)
+                    percept = llm_perceive(nav_state["last_frame"], task, context=_ctx,
+                                           clip_state=_clip_state_for_vlm)
+
+                # Emit raw VLM JSON to frontend before any merging so the user
+                # can see exactly what the model returned each call.
+                _vlm_raw = percept.pop("_raw", None)
+                if _vlm_raw and on_thought:
+                    on_thought(step, "vlm_raw", _vlm_raw[:280])
 
                 # Merge CLIP detection into percept: CLIP handles vis/bbox, VLM handles room/skill.
                 # Skip during verify_arrival scan so the confidence window reflects
@@ -530,10 +612,12 @@ def run_task(
                     "confidence":     float(percept.get("confidence", 0.0)),
                     "target_visible": bool(percept.get("target_visible", False)),
                     "room":           percept.get("room", "other"),
+                    "relevance":      float(percept.get("relevance", 0.0)),
                     "direction":      percept.get("direction", "not_visible"),
                     "robot_pos":      robot_pos.tolist(),
                     "topo_nodes":     topo_map.node_count,
                     "explored_pct":   explore_map.explored_fraction(),
+                    "vlm_raw":        _vlm_raw,
                 })
 
                 confidence  = float(percept.get("confidence", 0.0))
@@ -575,7 +659,8 @@ def run_task(
                 if _in_follow and vis:
                     _log(f"  [VLM decision] in follow_path → routing skipped (skill autonomy)")
 
-                if vis and not _in_verify and not _in_servo and not _in_follow:
+                if (vis and not _in_verify and not _in_servo and not _in_follow
+                        and rel >= 0.40 and room != "other"):
                     depth = env.get_depth()
                     tgt   = _estimate_target_pos(
                         depth, direction, robot_pos, R)
@@ -656,10 +741,20 @@ def run_task(
                                 tgt = _btgt_s
                                 nav_state["bbox_target"]        = True
                                 nav_state["target_arrive_dist"] = 0.5
+                                # Record snap XZ so verify_arrival can blacklist on failure
+                                nav_state["clip_snap_target"] = (round(float(tgt[0]), 1), round(float(tgt[2]), 1))
                                 _log(f"  [SNAP step={step}] no instances → bbox depth "
                                      f"({tgt[0]:.2f},{tgt[2]:.2f}) d={float(np.linalg.norm(tgt-robot_pos)):.1f}m")
+                            elif _bbox_s is not None and tgt is not None:
+                                # bbox depth failed (too close / noisy) but CLIP saw something.
+                                # Keep the direction-based tgt from _estimate_target_pos — it points
+                                # ~3-5m in the VLM/CLIP direction. Robot navigates there, then
+                                # STREAK-STOP or VALUE-STOP fires when it gets close.
+                                _log(f"  [SNAP step={step}] no instances, bbox depth failed → "
+                                     f"direction fallback ({tgt[0]:.2f},{tgt[2]:.2f}) "
+                                     f"d={float(np.linalg.norm(tgt-robot_pos)):.1f}m")
                             else:
-                                # No real 3D signal — let value-map frontier drive navigation.
+                                # No CLIP bbox and no bbox from VLM — nothing to navigate toward.
                                 tgt = None
                                 _log(f"  [SNAP step={step}] no instances, no bbox → frontier-only (rel={rel:.2f})")
 
@@ -709,18 +804,52 @@ def run_task(
                     _log(f"  [BRAIN step={step}] skill={_skill} reason={str(_reason)[:80]!r}")
                     _r_clean = str(_reason).strip()
                     _skip = {'str','other','not_visible','bathroom','','clear','clearly visible'}
+                    # Append sensor-based depth distance when CLIP sees the target
+                    _dist_hint = ""
+                    _cr = nav_state.get("last_clip", {})
+                    if _cr.get("visible") and _cr.get("bbox"):
+                        try:
+                            x1, y1, x2, y2 = _cr["bbox"]
+                            cx, cy = int((x1 + x2) / 2), int((y1 + y2) / 2)
+                            _d = float(env.get_depth()[cy, cx])
+                            if 0.3 < _d < 10.0:
+                                _dist_hint = f" [~{_d:.1f}m]"
+                        except Exception:
+                            pass
+                    # Append search_direction hint when target not visible
+                    _sd = percept.get("search_direction", "")
+                    if _sd and _sd not in ("none", "") and not percept.get("target_visible", False):
+                        _dist_hint += f" → {_sd}"
+
+                    # Use VLM search_direction="upstairs" to break the staircase
+                    # sighting catch-22: VLM can see stairs before the robot
+                    # physically reaches them, so record current pos as sighting.
+                    if (_sd == "upstairs"
+                            and nav_state.get("staircase_sighting") is None):
+                        nav_state["staircase_sighting"] = robot_pos.tolist()
+                        _log(f"  [STAIRCASE step={step}] VLM search_direction=upstairs"
+                             f" → sighting at ({robot_pos[0]:.1f},{robot_pos[2]:.1f})")
+                        if on_thought:
+                            on_thought(step, "plan", "Staircase spotted → recorded position, ready to ascend")
                     if on_thought and _r_clean not in _skip and len(_r_clean) >= 12:
-                        on_thought(step, _skill, _r_clean)
+                        on_thought(step, _skill, _r_clean + _dist_hint,
+                                   percept.get("room"))
                     _dh = nav_state.setdefault("decision_history", [])
                     _dh.append({"step": step, "skill": _skill, "reason": _r_clean[:60], "room": percept.get("room", "other")})
                     if len(_dh) > 3:
                         _dh.pop(0)
 
-                # BRAIN-SNAP: VLM says target visible, navigate now
+                # BRAIN-SNAP: VLM says target visible, navigate now.
+                # Require rel>=0.40 AND room!="other" to filter hallucinations
+                # where VLM contradicts itself (vis=True but rel=0.20, room=other).
+                _snap_rel  = float(percept.get("relevance", 0.0))
+                _snap_room = percept.get("room", "other")
                 if (_skill == "snap" and _vis4
                         and not _in_verify
                         and not _in_servo
-                        and nav_state.get("target_pos") is None):
+                        and nav_state.get("target_pos") is None
+                        and _snap_rel >= 0.40
+                        and _snap_room != "other"):
                     _depth4 = env.get_depth()
                     _dir4   = percept.get("direction", "center")
                     _tgt4   = _estimate_target_pos(_depth4, _dir4, robot_pos, R)
@@ -922,6 +1051,7 @@ def run_task(
 
             except Exception as e:
                 _log(f"  [VLM ERROR step={step}] {e}")
+                nav_state["vlm_step"] = step  # prevent retry storm on persistent error
 
         # ── Update value map ───────────────────────────────────────────
         vlm_score = float(nav_state["last_percept"].get("relevance", 0.2))
@@ -960,22 +1090,36 @@ def run_task(
         explore_map.update(robot_pos, R, vlm_score, direction=_vmap_dir)
 
         # ── VLFM proximity stop ────────────────────────────────────────
-        # Require BOTH CLIP signal AND VLM target_visible confirmation.
-        # With cosim rescaling, 0.50 ≈ raw cosim 0.25 (genuine target match).
-        # Guard: require step >= 50 so the robot leaves spawn first.
+        # Requires BOTH: CLIP > 0.50 AND explicit VLM visual confirmation.
+        # The former clip_streak>=3 independent gate caused false positives:
+        # white cabinets / door frames score high for 冰箱/衣柜, causing the
+        # robot to stop in the wrong room. STREAK-TRIGGER already wakes the VLM
+        # when streak>=5, so VLM confirmation is available when it matters.
         _vlm_vis_vm = nav_state.get("last_percept", {}).get("target_visible", False)
+        # Room-type sanity gate: block VALUE-STOP when clearly in the wrong room.
+        _WRONG_ROOM_BLOCK = {
+            "冰箱": {"bedroom", "bathroom", "staircase"},
+            "衣柜": {"kitchen", "bathroom", "staircase"},
+            "床":   {"kitchen", "bathroom", "staircase"},
+        }
+        _cur_room_vm  = nav_state.get("last_percept", {}).get("room", "other")
+        _room_blocked = _cur_room_vm in _WRONG_ROOM_BLOCK.get(task, set())
         if (step >= 50
                 and not nav_state.get("done", False)
                 and nav_state.get("current_skill") not in ("verify_arrival", "done")
                 and _clip_sc_vm > 0.50
-                and _vlm_vis_vm):
+                and _vlm_vis_vm
+                and not _room_blocked):
             _bvp = explore_map.best_value_pos(robot_pos)
             if _bvp is not None:
                 _bvd = float(np.sqrt(
                     (robot_pos[0] - _bvp[0])**2 + (robot_pos[2] - _bvp[2])**2))
                 if _bvd < 1.5:
-                    _log(f"  [VALUE-STOP step={step}] dist_to_best_cell={_bvd:.2f}m CLIP={_clip_sc_vm:.2f} → done")
+                    _log(f"  [VALUE-STOP step={step}] dist_to_best_cell={_bvd:.2f}m CLIP={_clip_sc_vm:.2f} room={_cur_room_vm} → done")
                     nav_state["done"] = True
+                    if on_thought:
+                        on_thought(step, "verify",
+                                   f"Reached target zone (heatmap peak {_bvd:.2f}m, CLIP={_clip_sc_vm:.2f}) → stop")
 
         # ── Stagnation / ESCAPE ────────────────────────────────────────
         if current_skill == "explore_frontier":

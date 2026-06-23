@@ -235,41 +235,82 @@ def verify_arrival(env, nav_state: dict) -> dict:
     instances      = nav_state.get("target_instances", [])
     _conf = float(percept.get("confidence", 0.0))
 
-    if dist <= ARRIVE_DIST:
+    # Accept up to 2.5m on entry: follow_path hands off at 1.2m but a final
+    # forward step can overshoot slightly, causing immediate dist > ARRIVE_DIST
+    # bounce → follow_path stagnation → explore (2-step false escape).
+    VERIFY_ACCEPT_DIST = 2.5
+    if dist <= VERIFY_ACCEPT_DIST:
         scanned = nav_state.get("verify_scanned", 0)
 
+        # ── VLM-based success path ───────────────────────────────────────
+        # VLM fires every 3 scan steps (forced via vlm_step in loop.py).
+        # New schema doesn't set target_visible; use direction+confidence instead.
+        # CLIP-MERGE is skipped during verify, so we must read VLM fields directly.
+        # Two VLM confirmations (≥6 rotation steps apart) → success even when
+        # CLIP scores are marginal (raw cosim ~0.24, rescaled ~0.33 < 0.35).
+        _vlm_dir   = percept.get("direction", "not_visible")
+        _vlm_conf  = float(percept.get("confidence", 0.0))
+        _vlm_step  = nav_state.get("vlm_step", -999)
+        _vlm_fresh = (step - _vlm_step) <= 1   # VLM fired this step or one step ago
+        if _vlm_fresh and _vlm_conf >= 0.65 and _vlm_dir not in ("not_visible", ""):
+            _vc = nav_state.get("verify_vlm_count", 0) + 1
+            nav_state["verify_vlm_count"] = _vc
+            print(f"  [VERIFY step={step}] VLM visible conf={_vlm_conf:.2f} dir={_vlm_dir} → vlm_count={_vc}", flush=True)
+            if _vc >= 2:
+                print(f"  [VERIFY step={step}] VLM×2 confirmed → SUCCESS", flush=True)
+                nav_state["done"]             = True
+                nav_state["current_skill"]    = "done"
+                nav_state["verify_best_clip"] = 0.0
+                nav_state["verify_vlm_count"] = 0
+                return nav_state
+
+        # ── CLIP-based success path ──────────────────────────────────────
         # Use CLIP score (every step) instead of VLM confidence (every 8 steps).
         # During a 24-step 360° scan, VLM fires only 3 times so most entries
         # would be 0.0 — CLIP gives a real signal at every rotation step.
         _clip_v = nav_state.get("last_clip", {}).get("score", 0.0)
         CONF_WINDOW = 6   # ~90° rotation
-        CONF_THRESH = 0.45  # cosim-rescaled: 0.45 ≈ raw cosim 0.24 (clear target)
+        # Lowered from 0.45: beds/fridges reach ~0.44 rescaled, old threshold
+        # was just out of reach causing consistent scan failure.
+        CONF_THRESH = 0.40  # raised from 0.30 — white walls average ~0.30
         window = nav_state.get("verify_conf_window", [])
         window.append(_clip_v)
         window = window[-CONF_WINDOW:]
         nav_state["verify_conf_window"] = window
 
-        # Early exit: three consecutive high-CLIP frames → done, no need for full scan.
+        # Track best CLIP score seen during this verify pass.
+        nav_state["verify_best_clip"] = max(nav_state.get("verify_best_clip", 0.0), _clip_v)
+
+        # Early exit: two consecutive high-CLIP frames AND fresh VLM confirmation.
+        # CLIP alone is insufficient — white walls/windows can score >0.38 for
+        # fridge/wardrobe. Require VLM to agree before stopping.
+        _vlm_step_v  = nav_state.get("vlm_step", -999)
+        _vlm_fresh_v = (step - _vlm_step_v) <= 2
+        _vlm_conf_v  = float(nav_state.get("last_percept", {}).get("confidence", 0.0))
+        _vlm_dir_v   = nav_state.get("last_percept", {}).get("direction", "not_visible")
+        _vlm_ok_v    = _vlm_fresh_v and _vlm_conf_v >= 0.60 and _vlm_dir_v not in ("not_visible", "")
         _vstreak = nav_state.get("verify_clip_streak", 0)
-        if _clip_v > 0.65:  # cosim-rescaled ≈ raw cosim 0.28 (strong target signal)
+        if _clip_v > 0.38:
             _vstreak += 1
         else:
             _vstreak = 0
         nav_state["verify_clip_streak"] = _vstreak
-        if _vstreak >= 3:
-            print(f"  [VERIFY step={step}] CLIP streak=3 score={_clip_v:.2f} → SUCCESS", flush=True)
-            nav_state["done"]          = True
-            nav_state["current_skill"] = "done"
+        if _vstreak >= 2 and _vlm_ok_v:
+            print(f"  [VERIFY step={step}] CLIP streak=2 score={_clip_v:.2f} + VLM conf={_vlm_conf_v:.2f} → SUCCESS", flush=True)
+            nav_state["done"]             = True
+            nav_state["current_skill"]    = "done"
+            nav_state["verify_best_clip"] = 0.0
+            nav_state["verify_vlm_count"] = 0
             return nav_state
 
         if len(window) >= CONF_WINDOW and scanned >= CONF_WINDOW:
             avg_conf = sum(window) / len(window)
             if avg_conf >= CONF_THRESH:
-                rx, rz = float(robot_pos[0]), float(robot_pos[2])
-                xz_inst = min(np.sqrt((float(p[0])-rx)**2 + (float(p[2])-rz)**2) for p in instances) if instances else dist
                 print(f"  [VERIFY step={step}] CLIP_avg={avg_conf:.2f} ≥ {CONF_THRESH} dist={dist:.3f}m → SUCCESS", flush=True)
-                nav_state["done"]          = True
-                nav_state["current_skill"] = "done"
+                nav_state["done"]             = True
+                nav_state["current_skill"]    = "done"
+                nav_state["verify_best_clip"] = 0.0
+                nav_state["verify_vlm_count"] = 0
                 return nav_state
 
         if scanned < 24:
@@ -292,10 +333,23 @@ def verify_arrival(env, nav_state: dict) -> dict:
                 )
                 if xz_near <= 1.5:
                     print(f"  [VERIFY step={step}] scan done, xz={xz_near:.3f}m ≤ 1.5m → SUCCESS", flush=True)
-                    nav_state["done"]          = True
-                    nav_state["current_skill"] = "done"
+                    nav_state["done"]             = True
+                    nav_state["current_skill"]    = "done"
+                    nav_state["verify_best_clip"] = 0.0
+                    nav_state["verify_vlm_count"] = 0
                     return nav_state
-            print(f"  [VERIFY step={step}] scan done, target NOT confirmed → explore", flush=True)
+            # If best CLIP during scan was strong enough, the object was seen — succeed.
+            # Lowered from 0.35: catches raw cosim ~0.24 (rescaled 0.33) which is
+            # marginal visibility (clearly above background noise at rescaled ~0.11).
+            _best = nav_state.get("verify_best_clip", 0.0)
+            if _best >= 0.28:
+                print(f"  [VERIFY step={step}] scan done, best_clip={_best:.2f} ≥ 0.28 → SUCCESS (seen during scan)", flush=True)
+                nav_state["done"]             = True
+                nav_state["current_skill"]    = "done"
+                nav_state["verify_best_clip"] = 0.0
+                nav_state["verify_vlm_count"] = 0
+                return nav_state
+            print(f"  [VERIFY step={step}] scan done, target NOT confirmed (best_clip={_best:.2f} vlm_count={nav_state.get('verify_vlm_count',0)}) → explore", flush=True)
             # Blacklist this CLIP-SNAP target so we don't revisit the same wrong spot
             _cst = nav_state.get("clip_snap_target")
             if _cst:
@@ -306,11 +360,15 @@ def verify_arrival(env, nav_state: dict) -> dict:
             nav_state["waypoints"]           = []
             nav_state["verify_scanned"]      = 0
             nav_state["verify_conf_window"]  = []
+            nav_state["verify_best_clip"]    = 0.0
+            nav_state["verify_vlm_count"]    = 0
     else:
-        print(f"  [VERIFY step={step}] dist={dist:.3f}m > {ARRIVE_DIST}m → follow_path", flush=True)
+        print(f"  [VERIFY step={step}] dist={dist:.3f}m > {VERIFY_ACCEPT_DIST}m → follow_path", flush=True)
         nav_state["current_skill"]      = "follow_path"
         nav_state["verify_scanned"]     = 0
         nav_state["verify_conf_window"] = []
+        nav_state["verify_best_clip"]   = 0.0
+        nav_state["verify_vlm_count"]   = 0
 
     return nav_state
 

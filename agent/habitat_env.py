@@ -112,7 +112,7 @@ def _make_config(
     overhead_spec.uuid        = "overhead"
     overhead_spec.sensor_type = SensorType.COLOR
     overhead_spec.resolution  = [320, 320]
-    overhead_spec.position    = [0.0, 4.0, 0.0]  # 4 m above agent origin
+    overhead_spec.position    = [0.0, 6.0, 0.0]  # 6 m above agent origin (4 m was inside ceiling)
     # orientation is Euler XYZ in radians; pitch -90° looks straight down
     overhead_spec.orientation = np.array([-np.pi / 2, 0.0, 0.0])
 

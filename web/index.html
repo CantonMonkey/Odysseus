@@ -184,6 +184,19 @@
     font-family: monospace;
   }
   .msg.thought .t-reason { font-style: italic; }
+  .msg.thought.vlm-raw {
+    background: #0f100a;
+    border-left-color: #4a5020;
+    opacity: 0.85;
+  }
+  .msg.thought.vlm-raw .t-reason {
+    font-family: monospace;
+    font-size: 10px;
+    font-style: normal;
+    color: #7a8a40;
+    word-break: break-all;
+    white-space: pre-wrap;
+  }
 
   #input-area {
     padding: 10px;
@@ -282,7 +295,8 @@ let navigating = false;
 
 // ── WebSocket ─────────────────────────────────────────────────
 
-const SKILL_ICON = {snap:'⚡', explore:'🔍', escape:'🚪', verify:'✅'};
+const SKILL_ICON  = {snap:'⚡', explore:'🔍', escape:'🚪', verify:'✅', sensor:'📡', plan:'🗺', vlm_raw:'🔬'};
+const SKILL_LABEL = {snap:'锁定目标', explore:'探索', escape:'突围', verify:'确认到达', sensor:'传感器', plan:'策略', vlm_raw:'VLM输出'};
 
 function drawToCanvas(c, ctx2d, b64, mime) {
   const img = new Image();
@@ -290,11 +304,14 @@ function drawToCanvas(c, ctx2d, b64, mime) {
   img.src = `data:${mime};base64,` + b64;
 }
 
-function addThought(step, skill, reason) {
+function addThought(step, skill, reason, extra) {
   const div = document.createElement('div');
-  div.className = 'msg thought';
-  const icon = SKILL_ICON[skill] || '💭';
-  div.innerHTML = `<div class="t-header">${icon} ${skill} · step ${step}</div>`
+  div.className = 'msg thought' + (skill === 'vlm_raw' ? ' vlm-raw' : '');
+  const icon  = SKILL_ICON[skill]  || '💭';
+  const label = SKILL_LABEL[skill] || skill;
+  let header = `${icon} <b>${label}</b> · step ${step}`;
+  if (extra && extra.room) header += ` · 📍${extra.room}`;
+  div.innerHTML = `<div class="t-header">${header}</div>`
                 + `<div class="t-reason">${reason}</div>`;
   chatMessages.appendChild(div);
   chatMessages.scrollTop = chatMessages.scrollHeight;
@@ -324,7 +341,7 @@ function connect() {
     } else if (data.type === 'map') {
       drawToCanvas(mapCanvas, ctxMap, data.img, 'image/png');
     } else if (data.type === 'thought') {
-      addThought(data.step, data.skill, data.reason);
+      addThought(data.step, data.skill, data.reason, data);
     } else if (data.type === 'status') {
       handleStatus(data);
     }

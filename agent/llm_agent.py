@@ -13,8 +13,11 @@ This module keeps all public exports for backward compatibility:
   perceive(), classify_scene(), DialogueAgent
 """
 
+import json
 import os
 from typing import Optional
+
+import requests
 
 from agent.backends.vllm_http     import VLLMBackend
 from agent.backends.internvl3     import InternVL3Backend
@@ -35,18 +38,19 @@ _rule_backend  = RuleBasedBackend()
 def perceive(frame, goal: str,
              annotated_frame=None,
              n_waypoints: int = 0,
-             context: dict = None) -> dict:
+             context: dict = None,
+             clip_state: dict = None) -> dict:
     """Analyse the current RGB frame with a VLM.
 
     Priority: vLLM server -> InternVL3 local -> Anthropic API -> rule-based.
     """
     if _vllm_backend is not None:
-        return _vllm_backend.perceive(frame, goal, annotated_frame, n_waypoints, context)
+        return _vllm_backend.perceive(frame, goal, annotated_frame, n_waypoints, context, clip_state)
     if _local_backend is not None:
-        return _local_backend.perceive(frame, goal, annotated_frame, n_waypoints, context)
+        return _local_backend.perceive(frame, goal, annotated_frame, n_waypoints, context, clip_state)
     client = _get_client()
     if client is not None:
-        return _api_backend.perceive(frame, goal, annotated_frame, n_waypoints, context)
+        return _api_backend.perceive(frame, goal, annotated_frame, n_waypoints, context, clip_state)
     return _rule_backend.perceive(frame, goal)
 
 
@@ -103,6 +107,35 @@ def classify_scene(frame, goal: str) -> dict:
         return json.loads(text[text.find("{"):text.rfind("}")+1])
     except Exception:
         return {"room": "other", "objects": [], "floor_hint": "unknown", "suggest": "none"}
+
+
+def plan_strategy(goal: str) -> dict:
+    """Episode-start strategy planning via text-only VLM call (no image)."""
+    from agent.backends._shared import _build_strategy_prompt, _STRATEGY_ROOM_ORDER
+    prompt = _build_strategy_prompt(goal)
+    if _vllm_backend is not None:
+        try:
+            resp = requests.post(
+                f"{_vllm_backend.base_url}/chat/completions",
+                json={
+                    "model": _vllm_backend.model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": 128,
+                    "temperature": 0.0,
+                },
+                timeout=15,
+            )
+            resp.raise_for_status()
+            text = resp.json()["choices"][0]["message"]["content"]
+            s, e = text.rfind("{"), text.rfind("}") + 1
+            if s >= 0 and e > s:
+                result = json.loads(text[s:e])
+                print(f"[STRATEGY] {goal}: {result}", flush=True)
+                return result
+        except Exception as ex:
+            print(f"[STRATEGY] plan failed: {ex}", flush=True)
+    default_rooms = _STRATEGY_ROOM_ORDER.get(goal, ["hallway", "living_room", "bedroom"])
+    return {"phase_rooms": default_rooms, "floor": 0, "reasoning": "commonsense fallback"}
 
 
 def _perceive_rule(frame, goal: str) -> dict:
