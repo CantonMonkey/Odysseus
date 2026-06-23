@@ -235,14 +235,6 @@ def verify_arrival(env, nav_state: dict) -> dict:
     instances      = nav_state.get("target_instances", [])
     _conf = float(percept.get("confidence", 0.0))
 
-    # Instant success if CLIP is already very high at verify entry — no scan needed.
-    _entry_clip = nav_state.get("last_clip", {}).get("score", 0.0)
-    if _entry_clip > 0.55:
-        print(f"  [VERIFY INSTANT step={step}] CLIP={_entry_clip:.2f} > 0.55 at entry → done", flush=True)
-        nav_state["done"]          = True
-        nav_state["current_skill"] = "done"
-        return nav_state
-
     # Accept up to 2.5m on entry: follow_path hands off at 1.2m but a final
     # forward step can overshoot slightly, causing immediate dist > ARRIVE_DIST
     # bounce → follow_path stagnation → explore (2-step false escape).
@@ -289,16 +281,22 @@ def verify_arrival(env, nav_state: dict) -> dict:
         # Track best CLIP score seen during this verify pass.
         nav_state["verify_best_clip"] = max(nav_state.get("verify_best_clip", 0.0), _clip_v)
 
-        # Early exit: two consecutive high-CLIP frames → done
-        # Threshold 0.35: raw cosim ~0.245, visible at close range
+        # Early exit: two consecutive high-CLIP frames AND fresh VLM confirmation.
+        # CLIP alone is insufficient — white walls/windows can score >0.38 for
+        # fridge/wardrobe. Require VLM to agree before stopping.
+        _vlm_step_v  = nav_state.get("vlm_step", -999)
+        _vlm_fresh_v = (step - _vlm_step_v) <= 2
+        _vlm_conf_v  = float(nav_state.get("last_percept", {}).get("confidence", 0.0))
+        _vlm_dir_v   = nav_state.get("last_percept", {}).get("direction", "not_visible")
+        _vlm_ok_v    = _vlm_fresh_v and _vlm_conf_v >= 0.60 and _vlm_dir_v not in ("not_visible", "")
         _vstreak = nav_state.get("verify_clip_streak", 0)
-        if _clip_v > 0.35:
+        if _clip_v > 0.38:
             _vstreak += 1
         else:
             _vstreak = 0
         nav_state["verify_clip_streak"] = _vstreak
-        if _vstreak >= 2:
-            print(f"  [VERIFY step={step}] CLIP streak=2 score={_clip_v:.2f} → SUCCESS", flush=True)
+        if _vstreak >= 2 and _vlm_ok_v:
+            print(f"  [VERIFY step={step}] CLIP streak=2 score={_clip_v:.2f} + VLM conf={_vlm_conf_v:.2f} → SUCCESS", flush=True)
             nav_state["done"]             = True
             nav_state["current_skill"]    = "done"
             nav_state["verify_best_clip"] = 0.0

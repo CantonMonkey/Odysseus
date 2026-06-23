@@ -830,11 +830,17 @@ def run_task(
                     if len(_dh) > 3:
                         _dh.pop(0)
 
-                # BRAIN-SNAP: VLM says target visible, navigate now
+                # BRAIN-SNAP: VLM says target visible, navigate now.
+                # Require rel>=0.40 AND room!="other" to filter hallucinations
+                # where VLM contradicts itself (vis=True but rel=0.20, room=other).
+                _snap_rel  = float(percept.get("relevance", 0.0))
+                _snap_room = percept.get("room", "other")
                 if (_skill == "snap" and _vis4
                         and not _in_verify
                         and not _in_servo
-                        and nav_state.get("target_pos") is None):
+                        and nav_state.get("target_pos") is None
+                        and _snap_rel >= 0.40
+                        and _snap_room != "other"):
                     _depth4 = env.get_depth()
                     _dir4   = percept.get("direction", "center")
                     _tgt4   = _estimate_target_pos(_depth4, _dir4, robot_pos, R)
