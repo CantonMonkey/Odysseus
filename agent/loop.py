@@ -612,10 +612,12 @@ def run_task(
                     "confidence":     float(percept.get("confidence", 0.0)),
                     "target_visible": bool(percept.get("target_visible", False)),
                     "room":           percept.get("room", "other"),
+                    "relevance":      float(percept.get("relevance", 0.0)),
                     "direction":      percept.get("direction", "not_visible"),
                     "robot_pos":      robot_pos.tolist(),
                     "topo_nodes":     topo_map.node_count,
                     "explored_pct":   explore_map.explored_fraction(),
+                    "vlm_raw":        _vlm_raw,
                 })
 
                 confidence  = float(percept.get("confidence", 0.0))

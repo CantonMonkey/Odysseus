@@ -23,13 +23,17 @@ class VLLMBackend:
         from agent.backends.rule_based import RuleBasedBackend
         use_frame = annotated_frame if annotated_frame is not None else frame
         b64 = _frame_to_jpeg_b64(use_frame)
+        prompt = _build_perceive_prompt(goal, n_waypoints, context, clip_state)
+        # Append hard constraint after the prompt body — InternVL tends to pretty-print
+        # multi-line JSON which gets truncated at max_tokens and breaks the parser.
+        prompt += "\nCRITICAL: Output ONLY a single compact JSON line. No markdown, no newlines inside the JSON, no ```. Keep 'reason' under 15 words."
         payload = {
             "model": self.model,
             "messages": [{"role": "user", "content": [
                 {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
-                {"type": "text", "text": _build_perceive_prompt(goal, n_waypoints, context, clip_state)},
+                {"type": "text", "text": prompt},
             ]}],
-            "max_tokens": 256,
+            "max_tokens": 512,
             "temperature": 0.0,
         }
         try:
