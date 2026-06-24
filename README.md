@@ -34,41 +34,51 @@ Chain mode outperforms single-goal by +22% SR and 3× SPL. Shared topological ma
 
 ## Architecture
 
-A dual-cadence design: a slow VLM brain (every 8 steps) sets semantic strategy while a fast CLIP sensor (every step) provides continuous target visibility. Both feed an online value map that biases frontier selection toward the goal.
+A dual-cadence design: a slow VLM brain makes semantic decisions while a fast CLIP sensor runs every step. Three distinct VLM call types coordinate macro planning, tactical perception, and arrival confirmation.
 
 ```
 User goal (Chinese)
        │
-       ├─[Episode start] VLM text-only → search strategy (room order, floor hint)
+       ▼
+① Episode-start planning  [VLM, text-only, no image]
+       plan_strategy(goal) → {phase_rooms: [kitchen, hallway, …], floor: 0}
+       Sets macro search order; stored in nav_state["search_strategy"]
        │
-       └─ Navigation loop
-              │
-              ├─ Every step
-              │     CLIP ViT-B/32 ──► target score + direction
-              │                           │
-              │                    ExploreMap value update (EMA per column)
-              │
-              ├─ Every 8 steps  (or CLIP streak ≥ 5 triggers early)
-              │     VLM InternVL3-8B  [RGB + context]
-              │       └─ room · relevance · skill · direction · reason
-              │                │              │
-              │           TopoMap         ExploreMap
-              │          add_node()    update_value()
-              │
-              └─ Skill dispatcher
-                    ├── explore_frontier  value-map frontier + topo room hints
-                    │                     Habitat A* pathfinder → waypoints
-                    ├── snap              depth estimate → 3D target → follow_path
-                    ├── follow_path       waypoint tracking toward locked target
-                    ├── verify_arrival    360° CLIP scan, sliding-window confirm
-                    └── escape            stagnation recovery → teleport
+       ▼
+② Navigation loop  ────────────────────────────────────────────────────────
+  │
+  ├─ Every step
+  │     CLIP ViT-B/32 ──► {score, direction, bbox}
+  │          │
+  │          ├─ clip_streak++  (reset on miss)
+  │          │
+  │          ├─ if streak ≥ 5 (first crossing): STREAK-TRIGGER
+  │          │       → force VLM re-eval this step (don't wait 8 steps)
+  │          │
+  │          └─ ExploreMap.update_value(score, direction)  [EMA per column]
+  │
+  ├─ Every 8 steps  OR  STREAK-TRIGGER  OR  clip_streak just crossed 3
+  │     VLM InternVL3-8B  [image + context]                    ← ② perceive
+  │       └─ {room, relevance, skill, direction, reason, search_direction}
+  │                │              │                │
+  │           TopoMap        ExploreMap        skill decision
+  │          add_node()   update_value()    (snap/explore/verify/escape)
+  │
+  └─ Skill dispatcher
+        ├── explore_frontier  phase_rooms hint → topo goto → value-map frontier
+        │                     Habitat A* pathfinder → waypoints
+        ├── snap              depth column → 3D target pos → follow_path
+        ├── follow_path       waypoint tracking toward locked target
+        ├── verify_arrival    360° scan, sliding-window CLIP (N=6, thresh=0.65)
+        └── escape            stagnation recovery → random teleport
 ```
 
 **Key design choices**
 
-- **VLM as brain, CLIP as fast sensor** — VLM sets 8-step strategy; CLIP catches the target every step without VLM latency
+- **Three VLM modes** — text-only macro planner (episode start), image perceive (every 8 steps), CLIP-triggered re-eval (streak ≥ 5)
+- **CLIP as fast sensor** — runs every step without VLM latency; STREAK-TRIGGER bridges CLIP confidence into VLM decisions
 - **Value map = spatial memory** — VLM relevance scores accumulated (EMA) over direction columns; frontiers ranked by expected target proximity
-- **Topological map** — room-level graph routes macro navigation (go to known kitchen) while frontier exploration handles local search
+- **Topological map** — room-level graph provides macro routing (go to known kitchen node); frontier exploration handles local search within the room
 - **No privileged simulator info** — agent uses only RGB-D + odometry; no ground-truth positions or semantic labels at runtime
 
 ---
