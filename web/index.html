@@ -246,12 +246,12 @@
     <div id="conn-indicator" title="WebSocket 状态"></div>
   </div>
 
-  <!-- Overhead + Map -->
+  <!-- Topo + Map -->
   <div id="side-panels">
     <div class="side-block">
-      <div class="side-label">俯视图 / Overhead</div>
+      <div class="side-label">拓扑地图 / Topo</div>
       <div class="side-canvas-wrap">
-        <canvas id="overhead-canvas" width="320" height="320"></canvas>
+        <canvas id="topo-canvas" width="320" height="320"></canvas>
       </div>
     </div>
     <div class="side-block">
@@ -275,12 +275,12 @@
 </main>
 
 <script>
-const canvas         = document.getElementById('canvas');
-const overheadCanvas = document.getElementById('overhead-canvas');
-const mapCanvas      = document.getElementById('map-canvas');
-const ctx            = canvas.getContext('2d');
-const ctxOverhead    = overheadCanvas.getContext('2d');
-const ctxMap         = mapCanvas.getContext('2d');
+const canvas     = document.getElementById('canvas');
+const topoCanvas = document.getElementById('topo-canvas');
+const mapCanvas  = document.getElementById('map-canvas');
+const ctx        = canvas.getContext('2d');
+const ctxTopo    = topoCanvas.getContext('2d');
+const ctxMap     = mapCanvas.getContext('2d');
 
 const statusBadge   = document.getElementById('status-badge');
 const infoSkill     = document.getElementById('info-skill');
@@ -336,8 +336,8 @@ function connect() {
     if (data.type === 'frame') {
       drawToCanvas(canvas, ctx, data.img, 'image/jpeg');
       updateNav(data);
-    } else if (data.type === 'overhead') {
-      drawToCanvas(overheadCanvas, ctxOverhead, data.img, 'image/jpeg');
+    } else if (data.type === 'topo') {
+      drawToCanvas(topoCanvas, ctxTopo, data.img, 'image/png');
     } else if (data.type === 'map') {
       drawToCanvas(mapCanvas, ctxMap, data.img, 'image/png');
     } else if (data.type === 'thought') {

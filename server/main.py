@@ -57,9 +57,6 @@ def _habitat_worker():
     FIXED_SPAWN = [-8.24, 0.163, -1.47]  # living room, good demo start
     env.reset(SCENE_DIR, start_pos=FIXED_SPAWN)
     _frame_q.put(("frame", env.get_frame(), {"status": "idle"}))
-    overhead = env.get_overhead_frame()
-    if overhead is not None:
-        _frame_q.put(("overhead", overhead, {"status": "idle"}))
 
     _explore_map = None  # preserved across tasks (grid + topo, value reset per task)
     _topo_map    = None
@@ -83,21 +80,15 @@ def _habitat_worker():
                 }
                 _frame_q.put(("frame", frame, state))
 
-                overhead = env.get_overhead_frame()
-                if overhead is not None:
-                    _pct = float(np.count_nonzero(overhead)) / overhead.size
-                    if _pct < 0.01:
-                        print(f"[Server] overhead {_pct:.1%} nonzero — camera inside geometry", flush=True)
-                    _frame_q.put(("overhead", overhead, state))
-
-                # Read live explore_map from nav_state (was using server-level
-                # _explore_map which is None during navigation).
                 if step % 10 == 0:
+                    robot_pose = env.get_robot_pose()
                     _live_map = nav_state.get("explore_map")
                     if _live_map is not None:
-                        robot_pose = env.get_robot_pose()
                         map_png = _map_to_png(_live_map, robot_pose)
                         _frame_q.put(("map", map_png, state))
+                    _live_topo = nav_state.get("_topo_map")
+                    topo_png = _topo_to_png(_live_topo, robot_pose)
+                    _frame_q.put(("topo", topo_png, state))
 
             def on_thought(step, skill, reason, room=None):
                 payload = {
@@ -150,12 +141,9 @@ async def _frame_broadcaster():
                 "img":  base64.b64encode(jpeg).decode(),
                 **state,
             }
-        elif kind == "overhead":
-            jpeg    = _frame_to_jpeg(frame)
-            payload = {"type": "overhead", "img": base64.b64encode(jpeg).decode(), **state}
-        elif kind == "map":
-            # frame is already PNG bytes here
-            payload = {"type": "map", "img": base64.b64encode(frame).decode(), **state}
+        elif kind in ("map", "topo"):
+            # frame is already PNG bytes
+            payload = {"type": kind, "img": base64.b64encode(frame).decode(), **state}
         elif kind == "thought":
             payload = {"type": "thought", **state}
         else:
@@ -244,6 +232,61 @@ def _frame_to_jpeg(frame: np.ndarray) -> bytes:
     img = Image.fromarray(frame.astype(np.uint8))
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=80)
+    return buf.getvalue()
+
+
+def _topo_to_png(topo_map, robot_pose, size: int = 320) -> bytes:
+    """Render the TopoMap as a top-down PNG: nodes (colored by room) + edges + robot."""
+    from PIL import Image, ImageDraw
+    img  = Image.new("RGB", (size, size), (18, 18, 18))
+    draw = ImageDraw.Draw(img)
+
+    nodes = topo_map.nodes if topo_map else []
+    pos, _ = robot_pose
+
+    ROOM_COLOR = {
+        "kitchen":     (255, 140,  30),
+        "bedroom":     ( 80, 140, 220),
+        "living_room": ( 60, 180,  80),
+        "bathroom":    (  0, 190, 190),
+        "hallway":     (210, 200,  50),
+        "staircase":   (180,  90, 220),
+        "other":       (110, 110, 110),
+    }
+
+    all_x = [n.pos[0] for n in nodes] + [pos[0]]
+    all_z = [n.pos[2] for n in nodes] + [pos[2]]
+    margin = 24
+    span   = max(max(all_x) - min(all_x), max(all_z) - min(all_z), 6.0)
+    cx     = (min(all_x) + max(all_x)) / 2
+    cz     = (min(all_z) + max(all_z)) / 2
+    scale  = (size - 2 * margin) / span
+
+    def w2i(x, z):
+        return (int((x - cx) * scale + size / 2),
+                int(-(z - cz) * scale + size / 2))
+
+    if not nodes:
+        draw.text((size // 2 - 32, size // 2 - 6), "no nodes yet", fill=(70, 70, 70))
+    else:
+        for edge in (topo_map.edges if topo_map else []):
+            a, b = topo_map.nodes[edge.a], topo_map.nodes[edge.b]
+            draw.line([w2i(a.pos[0], a.pos[2]), w2i(b.pos[0], b.pos[2])],
+                      fill=(50, 50, 50), width=1)
+        for node in nodes:
+            px, pz = w2i(node.pos[0], node.pos[2])
+            color  = ROOM_COLOR.get(node.room, ROOM_COLOR["other"])
+            r = 6
+            draw.ellipse([px-r, pz-r, px+r, pz+r], fill=color, outline=(200, 200, 200))
+            label = node.room[:3] if node.room else "?"
+            draw.text((px + r + 2, pz - 4), label, fill=(170, 170, 170))
+
+    rx, rz = w2i(pos[0], pos[2])
+    rr = 5
+    draw.ellipse([rx-rr, rz-rr, rx+rr, rz+rr], fill=(255, 60, 60), outline=(255, 200, 200))
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
     return buf.getvalue()
 
 

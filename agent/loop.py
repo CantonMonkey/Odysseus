@@ -1271,6 +1271,7 @@ def run_task(
         else:
             nav_state = _explore_frontier(env, nav_state, explore_map, topo_map)
 
+        nav_state["_topo_map"] = topo_map
         if on_frame and nav_state.get("last_frame") is not None:
             on_frame(nav_state["last_frame"], nav_state)
 
