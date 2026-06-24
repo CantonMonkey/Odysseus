@@ -18,7 +18,7 @@ nohup "$VLLM_BIN" serve "$MODEL" \
   --trust-remote-code \
   --host 127.0.0.1 \
   --port $PORT \
-  --max-model-len 4096 \
+  --max-model-len 8192 \
   --gpu-memory-utilization 0.75 \
   --no-enable-prefix-caching \
   > /tmp/vllm_server.log 2>&1 &
