@@ -46,6 +46,9 @@ CLIP Detector (ViT-B/32, every step) ← fast target visibility signal
 Online ExploreMap (2D occupancy + value map)
   └─ frontier selection biased by VLM relevance scores
 
+TopoMap (room-level graph)
+  └─ route to known room node; trigger go_upstairs when needed
+
 Skills
   ├── explore_frontier  ← go to highest-value unexplored frontier
   ├── follow_path       ← Habitat pathfinder → waypoint tracking
@@ -72,18 +75,18 @@ Skills
 - [x] Eval harness: 3 goals × 3 episodes, SR / SPL / SoftSPL / PathLen
 
 ### TODO
-- [ ] **CLIP → value map accumulation**: CLIP runs every step but scores are not written to the value map; only VLM (every 8 steps) updates it. Accumulating CLIP scores at each step would give VLFM-style continuous guidance and pull frontiers toward observed target locations.
-- [ ] **Scene coverage**: current expl ≈ 5–8%. Frontier scoring needs to balance exploration breadth vs. target-seeking to escape local loops.
-- [ ] **Multi-scene eval**: currently locked to scene 00800. Generalisation across HM3D minival not yet tested.
-- [ ] **VLM direct decision**: remove intermediate confidence/visibility gates; let the VLM skill output drive navigation directly (AgentVLN paradigm).
-- [ ] **Pluggable framework**: swap VLM backend (vLLM / local / API) and add custom skills without touching core loop (hloc-style one-liner).
+- [ ] **CLIP → value map**: accumulate per-step CLIP scores into the value map for continuous VLFM-style guidance
+- [ ] **Scene coverage**: improve frontier scoring to escape local loops (current coverage ~5–8%)
+- [ ] **Multi-scene eval**: generalise beyond the single training scene; test on full HM3D minival
+- [ ] **VLM-direct decisions**: let the VLM skill output drive navigation without intermediate confidence gates (AgentVLN style)
+- [ ] **Pluggable backend**: swap VLM (vLLM / local / API) and add custom skills without touching core loop
 
 ---
 
 ## Quickstart
 
 ```bash
-# On autodl4090 (GPU required for InternVL3 + Habitat-Sim)
+# On GPU server (requires InternVL3 + Habitat-Sim)
 conda activate habitat
 
 # 1. Start vLLM server (InternVL3-8B)
@@ -95,8 +98,8 @@ python eval.py --goals 沙发 --episodes 3 --max-steps 300
 # 2b. Run full suite (single + cross-floor + multi-stage chain)
 python eval_full.py --log-dir /tmp/eval_full
 
-# 3. Start web server (accessible via SSH tunnel on port 6006)
-python server.py
+# 3. Start web server (port 6006)
+python -m uvicorn server.main:app --host 0.0.0.0 --port 6006
 ```
 
 SSH tunnel for local browser access:

@@ -67,6 +67,14 @@ def _habitat_worker():
             env.close()
             break
 
+        if cmd == "__reset__":
+            env.reset(SCENE_DIR, start_pos=FIXED_SPAWN)
+            _explore_map = None
+            _topo_map    = None
+            _frame_q.put(("frame", env.get_frame(), {"status": "idle"}))
+            _frame_q.put(("status", None, {"status": "reset", "message": "已重置"}))
+            continue
+
         goal = cmd  # str
 
         try:
@@ -80,15 +88,20 @@ def _habitat_worker():
                 }
                 _frame_q.put(("frame", frame, state))
 
-                if step % 10 == 0:
+                _live_topo = nav_state.get("_topo_map")
+                needs_map  = (step % 10 == 0)
+                needs_topo = (_live_topo is not None and bool(_live_topo.nodes))
+
+                if needs_map or needs_topo:
                     robot_pose = env.get_robot_pose()
-                    _live_map = nav_state.get("explore_map")
-                    if _live_map is not None:
-                        map_png = _map_to_png(_live_map, robot_pose)
-                        _frame_q.put(("map", map_png, state))
-                    _live_topo = nav_state.get("_topo_map")
-                    topo_png = _topo_to_png(_live_topo, robot_pose)
-                    _frame_q.put(("topo", topo_png, state))
+                    if needs_map:
+                        _live_map = nav_state.get("explore_map")
+                        if _live_map is not None:
+                            map_png = _map_to_png(_live_map, robot_pose)
+                            _frame_q.put(("map", map_png, state))
+                    if needs_topo:
+                        topo_png = _topo_to_png(_live_topo, robot_pose)
+                        _frame_q.put(("topo", topo_png, state))
 
             def on_thought(step, skill, reason, room=None):
                 payload = {
@@ -107,6 +120,12 @@ def _habitat_worker():
 
             _explore_map = result.get("explore_map")  # preserve spatial knowledge
             _topo_map    = result.get("topo_map")
+
+            # Push final topo snapshot so the canvas shows the complete map on arrival
+            if _topo_map and _topo_map.nodes:
+                _final_state = {"status": "done", "goal": goal, "step": -1, "skill": ""}
+                _final_pose  = env.get_robot_pose()
+                _frame_q.put(("topo", _topo_to_png(_topo_map, _final_pose), _final_state))
 
             if result.get("done"):
                 msg   = dialogue.arrival_message()
@@ -186,6 +205,14 @@ async def root():
 
 class CommandRequest(BaseModel):
     text: str
+
+
+@app.post("/reset")
+async def reset_maps():
+    if _nav_active.is_set():
+        return {"ok": False, "error": "导航中，无法重置"}
+    _cmd_q.put("__reset__")
+    return {"ok": True}
 
 
 @app.post("/command")
