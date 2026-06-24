@@ -760,9 +760,10 @@ def run_task(
 
                         if tgt is not None:
                             old_skill = nav_state.get("current_skill")
-                            nav_state["target_pos"]    = tgt.tolist()
-                            nav_state["current_skill"] = "follow_path"
-                            nav_state["waypoints"]     = []
+                            nav_state["target_pos"]          = tgt.tolist()
+                            nav_state["current_skill"]       = "follow_path"
+                            nav_state["waypoints"]           = []
+                            nav_state["follow_tried_verify"] = False
                             if old_skill != "follow_path":
                                 _log(f"  [VLM decision] {old_skill} → follow_path (target detected conf={confidence:.2f})")
                 elif not vis:
@@ -874,9 +875,10 @@ def run_task(
                                 if _n4 is None: _n4 = _ps4[0]
                                 _sn4 = np.array([float(_n4[0]), float(_tgt4[1]),
                                                  float(_n4[2])], dtype=np.float32)
-                                nav_state["target_pos"]    = _sn4.tolist()
-                                nav_state["current_skill"] = "follow_path"
-                                nav_state["waypoints"]     = []
+                                nav_state["target_pos"]          = _sn4.tolist()
+                                nav_state["current_skill"]       = "follow_path"
+                                nav_state["waypoints"]           = []
+                                nav_state["follow_tried_verify"] = False
                                 stats["snap_events"] += 1
                                 _log(f"  [BRAIN-SNAP step={step}] conf={_conf4:.2f} "
                                      f"\u2192 follow_path ({_n4[0]:.2f},{_n4[2]:.2f})")
@@ -885,11 +887,12 @@ def run_task(
                             _bbox4b  = percept.get("bbox")
                             _btgt4b  = _estimate_pos_from_bbox(env.get_depth(), _bbox4b, robot_pos, R) if _bbox4b else None
                             if _btgt4b is not None:
-                                nav_state["target_pos"]         = _btgt4b.tolist()
-                                nav_state["current_skill"]      = "follow_path"
-                                nav_state["waypoints"]          = []
-                                nav_state["bbox_target"]        = True
-                                nav_state["target_arrive_dist"] = 0.5
+                                nav_state["target_pos"]          = _btgt4b.tolist()
+                                nav_state["current_skill"]       = "follow_path"
+                                nav_state["waypoints"]           = []
+                                nav_state["bbox_target"]         = True
+                                nav_state["target_arrive_dist"]  = 0.5
+                                nav_state["follow_tried_verify"] = False
                                 stats["snap_events"] += 1
                                 _log(f"  [BRAIN-SNAP step={step}] bbox \u2192 follow_path "
                                      f"({_btgt4b[0]:.2f},{_btgt4b[2]:.2f}) "

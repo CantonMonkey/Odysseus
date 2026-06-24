@@ -122,16 +122,27 @@ def follow_path(env, nav_state: dict) -> dict:
 
     if nav_state.get("follow_stagnant", 0) >= FOLLOW_STAGNANT_LIMIT:
         tgt = nav_state.get("target_pos")
+        # If robot is close enough for visual confirmation, try verify_arrival
+        # before blacklisting. Depth estimates often land inside furniture (unreachable)
+        # but the robot is visually adjacent.
+        VERIFY_ACCEPT_DIST = 2.5
+        if tgt and dist <= VERIFY_ACCEPT_DIST and not nav_state.get("follow_tried_verify"):
+            print(f"  [FOLLOW step={step}] stagnant dist={dist:.2f}m ≤ {VERIFY_ACCEPT_DIST}m → try verify_arrival", flush=True)
+            nav_state["current_skill"]      = "verify_arrival"
+            nav_state["follow_stagnant"]    = 0
+            nav_state["follow_tried_verify"] = True
+            return nav_state
         if tgt:
             key = (round(tgt[0], 1), round(tgt[2], 1))
             nav_state.setdefault("blacklisted_snap", set()).add(key)
             print(f"  [FOLLOW step={step}] stagnant {FOLLOW_STAGNANT_LIMIT} steps dist={dist:.2f}m → blacklist ({key[0]},{key[1]}) + explore", flush=True)
-        nav_state["target_pos"]         = None
-        nav_state["current_skill"]      = "explore_frontier"
-        nav_state["follow_stagnant"]    = 0
-        nav_state["waypoints"]          = []
-        nav_state["bbox_target"]        = False
-        nav_state["target_arrive_dist"] = ARRIVE_DIST
+        nav_state["target_pos"]          = None
+        nav_state["current_skill"]       = "explore_frontier"
+        nav_state["follow_stagnant"]     = 0
+        nav_state["follow_tried_verify"] = False
+        nav_state["waypoints"]           = []
+        nav_state["bbox_target"]         = False
+        nav_state["target_arrive_dist"]  = ARRIVE_DIST
         return nav_state
 
     waypoints = nav_state.get("waypoints", [])
