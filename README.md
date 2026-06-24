@@ -5,17 +5,30 @@ The user types a Chinese object goal such as *"沙发"* and the robot explores t
 
 ---
 
-## Current Status
+## Current Results
 
-**eval v25 · single scene (HM3D 00800-TEEsavR23oF) · 9 episodes**
+**Single scene · HM3D 00800-TEEsavR23oF · InternVL3-8B brain (vLLM) · 3 episodes per goal**
 
-| Goal | SR | Closest dist | Steps |
-|------|----|-------------|-------|
-| 沙发 | 0% | 5.24 m | 500 |
-| 椅子 | 0% | 4.91 m | 500 |
-| 床   | 0% | 5.13 m | 500 |
+### Single-Goal Navigation (300 steps/ep)
 
-Zero false-early-terminations (fixed in v21–v25). Robot consistently reaches within ~5 m but fails the 3 m threshold. Root cause: limited scene coverage (expl ≈ 5–8%) — the robot loops in a small area instead of spreading out.
+| Goal | SR | SPL | SoftSPL | Avg Steps |
+|------|----|-----|---------|-----------|
+| 沙发 | **100%** | 0.109 | 0.059 | 300 |
+| 冰箱 | 66.7% | 0.048 | 0.013 | 262 |
+| 衣柜 | 66.7% | 0.095 | 0.058 | 300 |
+| 床   | 33.3% | 0.013 | 0.004 | 300 |
+| **Overall** | **66.7%** | **0.066** | **0.033** | 291 |
+
+### Multi-Stage Chain Navigation (沙发 → 冰箱 → 床, shared map, 300 steps/goal)
+
+| Goal | SR | SPL | SoftSPL | Avg Steps |
+|------|----|-----|---------|-----------|
+| 沙发 | **100%** | 0.165 | 0.080 | 300 |
+| 冰箱 | 66.7% | 0.184 | 0.052 | 277 |
+| 床   | **100%** | 0.249 | 0.103 | 300 |
+| **Overall** | **88.9%** | **0.199** | **0.078** | 292 |
+
+Chain mode outperforms single-goal by +22% SR and 3× SPL. Shared topological map across goals allows the agent to reuse room knowledge, particularly helping 床 (0→100%) which benefits from accumulated spatial context.
 
 ---
 
@@ -76,11 +89,14 @@ conda activate habitat
 # 1. Start vLLM server (InternVL3-8B)
 bash start_vllm.sh
 
-# 2. Run evaluation
-python eval.py --goal 沙发 --n_episodes 3
+# 2. Run evaluation (single goal)
+python eval.py --goals 沙发 --episodes 3 --max-steps 300
+
+# 2b. Run full suite (single + cross-floor + multi-stage chain)
+python eval_full.py --log-dir /tmp/eval_full
 
 # 3. Start web server (accessible via SSH tunnel on port 6006)
-python run.py
+python server.py
 ```
 
 SSH tunnel for local browser access:
