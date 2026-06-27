@@ -627,6 +627,8 @@ def run_task(
                        or (percept.get("skill") == "snap"
                            and direction not in ("not_visible", "")
                            and confidence >= 0.5))
+                # Save for VALUE-STOP: broader than target_visible (CLIP-only), includes VLM snap inference
+                nav_state["last_vlm_vis"] = vis
                 room        = percept.get("room", "other")
                 rel         = float(percept.get("relevance", 0.0))
                 target_room = str(percept.get("target_room", "") or "").strip()
@@ -845,7 +847,7 @@ def run_task(
                 # where VLM contradicts itself (vis=True but rel=0.20, room=other).
                 _snap_rel  = float(percept.get("relevance", 0.0))
                 _snap_room = percept.get("room", "other")
-                if (_skill == "snap" and _vis4
+                if (_skill == "snap" and vis
                         and not _in_verify
                         and not _in_servo
                         and nav_state.get("target_pos") is None
@@ -914,11 +916,12 @@ def run_task(
                         nav_state["servo_steps"]   = 0
                         nav_state["servo_lost"]    = 0
                         _log(f"  [SERVO trigger step={step}] vis_consecutive={_vsc} conf={_conf4:.2f} dir={direction} \u2192 visual_servo")
-                elif not vis:
+                else:
                     nav_state["vis_consecutive"] = 0
 
-                # BRAIN-ESCAPE: VLM says stuck, escape now (bypass 40-step wait)
-                elif (_skill == "escape"
+                # BRAIN-ESCAPE: VLM says stuck, escape now (bypass 40-step wait).
+                # Standalone if \u2014 not in the vis/elif chain so it fires even when vis=False.
+                if (_skill == "escape"
                       and current_skill == "explore_frontier"
                       and nav_state.get("anchor_steps_left", 0) <= 0):
                     from agent.skills import _replan as _rpl4
@@ -963,8 +966,10 @@ def run_task(
                         _log(f"  [BRAIN-ESCAPE step={step}] dist={_ebd4:.1f}m "
                              f"tgt=({_erl4[0]:.1f},{_erl4[2]:.1f}) VLM-triggered")
 
-                # BRAIN-VERIFY: VLM says very close, jump to verify_arrival
-                elif (_skill == "verify"
+                # BRAIN-VERIFY: VLM says very close, jump to verify_arrival.
+                # Standalone if — not in the vis/elif chain so it fires even when vis=False.
+                if (_skill == "verify"
+                      and not nav_state.get("done", False)
                       and nav_state.get("target_pos") is None
                       and current_skill != "verify_arrival"):
                     # Fast path: VLM high-confidence + CLIP already sees target \u2192 stop now.
@@ -1111,7 +1116,7 @@ def run_task(
         # white cabinets / door frames score high for 冰箱/衣柜, causing the
         # robot to stop in the wrong room. STREAK-TRIGGER already wakes the VLM
         # when streak>=5, so VLM confirmation is available when it matters.
-        _vlm_vis_vm = nav_state.get("last_percept", {}).get("target_visible", False)
+        _vlm_vis_vm = nav_state.get("last_vlm_vis", False)
         # Room-type sanity gate: block VALUE-STOP when clearly in the wrong room.
         _WRONG_ROOM_BLOCK = {
             "冰箱": {"bedroom", "bathroom", "staircase"},
