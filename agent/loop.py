@@ -441,7 +441,7 @@ def run_task(
                 and current_skill not in ("verify_arrival", "done")
                 and instances):
             _idist_prox = _inst_dist(robot_pos, instances)
-            if _idist_prox is not None and _idist_prox <= 3.0:
+            if _idist_prox is not None and _idist_prox <= 2.0:
                 rx, rz = float(robot_pos[0]), float(robot_pos[2])
                 nearest_inst = min(instances,
                                    key=lambda p: (float(p[0])-rx)**2 + (float(p[2])-rz)**2)
@@ -1135,7 +1135,7 @@ def run_task(
             if _bvp is not None:
                 _bvd = float(np.sqrt(
                     (robot_pos[0] - _bvp[0])**2 + (robot_pos[2] - _bvp[2])**2))
-                if _bvd < 3.0:
+                if _bvd < 2.0:
                     _log(f"  [VALUE-STOP step={step}] dist_to_best_cell={_bvd:.2f}m CLIP={_clip_sc_vm:.2f} room={_cur_room_vm} → done")
                     nav_state["done"] = True
                     if on_thought:

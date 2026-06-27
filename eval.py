@@ -113,7 +113,7 @@ def _load_all_instances(scene_dir: str, goals: List[str],
 # Constants
 # ---------------------------------------------------------------------------
 
-SUCCESS_DIST  = 3.0           # metres
+SUCCESS_DIST  = 2.0           # metres
 _DATA_DEFAULT = Path("/root/autodl-tmp/data/hm3d")
 DATA_DIR      = Path(os.environ.get("VLN_DATA_DIR", str(_DATA_DEFAULT)))
 DEFAULT_SCENE = str(DATA_DIR / "00800-TEEsavR23oF")

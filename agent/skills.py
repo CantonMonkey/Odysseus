@@ -17,7 +17,7 @@ try:
 except ImportError:
     _HAS_QUATERNION = False
 
-ARRIVE_DIST  = 3.0   # goal-reached threshold (m); aligned with eval SUCCESS_DIST=3m
+ARRIVE_DIST  = 2.0   # goal-reached threshold (m); aligned with eval SUCCESS_DIST=2m
 ALIGN_THRESH = 12.0  # heading alignment threshold before moving forward (deg)
 WP_REACH     = 0.4   # waypoint-reached threshold (m)
 
