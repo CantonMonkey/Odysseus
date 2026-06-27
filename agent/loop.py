@@ -441,7 +441,7 @@ def run_task(
                 and current_skill not in ("verify_arrival", "done")
                 and instances):
             _idist_prox = _inst_dist(robot_pos, instances)
-            if _idist_prox is not None and _idist_prox <= ARRIVE_DIST:
+            if _idist_prox is not None and _idist_prox <= 3.0:
                 rx, rz = float(robot_pos[0]), float(robot_pos[2])
                 nearest_inst = min(instances,
                                    key=lambda p: (float(p[0])-rx)**2 + (float(p[2])-rz)**2)
@@ -967,22 +967,32 @@ def run_task(
                 elif (_skill == "verify"
                       and nav_state.get("target_pos") is None
                       and current_skill != "verify_arrival"):
-                    _vd4 = _inst_dist(robot_pos, instances)
-                    if _vd4 is not None and instances:
-                        _rx4 = float(robot_pos[0]); _rz4 = float(robot_pos[2])
-                        _vn4 = min(instances,
-                                   key=lambda p: (float(p[0])-_rx4)**2+(float(p[2])-_rz4)**2)
-                        nav_state["target_pos"]    = [float(_vn4[0]), float(robot_pos[1]),
-                                                      float(_vn4[2])]
-                        nav_state["current_skill"] = "verify_arrival"
-                        _log(f"  [BRAIN-VERIFY step={step}] dist={_vd4:.2f}m \u2192 verify_arrival")
-                    elif not instances:
-                        # No GT: use depth estimate toward VLM direction, fall back to robot pos.
-                        _dir_v = percept.get("direction", "center")
-                        _tgt_v = _estimate_target_pos(env.get_depth(), _dir_v, robot_pos, R)
-                        nav_state["target_pos"]    = _tgt_v.tolist() if _tgt_v is not None else robot_pos.tolist()
-                        nav_state["current_skill"] = "verify_arrival"
-                        _log(f"  [BRAIN-VERIFY step={step}] depth-only \u2192 verify_arrival")
+                    # Fast path: VLM high-confidence + CLIP already sees target \u2192 stop now.
+                    # Bypasses the depth-estimate distance gate that previously blocked this path.
+                    _clip_bv = float(nav_state.get("last_clip", {}).get("score", 0.0))
+                    if _conf4 >= 0.65 and _clip_bv > 0.35:
+                        nav_state["done"] = True
+                        _log(f"  [BRAIN-VERIFY-STOP step={step}] VLM conf={_conf4:.2f} CLIP={_clip_bv:.2f} \u2192 done")
+                        if on_thought:
+                            on_thought(step, "verify",
+                                       f"\u76ee\u6807\u786e\u8ba4\u5230\u8fbe (VLM conf={_conf4:.2f}, CLIP={_clip_bv:.2f})")
+                    else:
+                        _vd4 = _inst_dist(robot_pos, instances)
+                        if _vd4 is not None and instances:
+                            _rx4 = float(robot_pos[0]); _rz4 = float(robot_pos[2])
+                            _vn4 = min(instances,
+                                       key=lambda p: (float(p[0])-_rx4)**2+(float(p[2])-_rz4)**2)
+                            nav_state["target_pos"]    = [float(_vn4[0]), float(robot_pos[1]),
+                                                          float(_vn4[2])]
+                            nav_state["current_skill"] = "verify_arrival"
+                            _log(f"  [BRAIN-VERIFY step={step}] dist={_vd4:.2f}m \u2192 verify_arrival")
+                        elif not instances:
+                            # No GT: use depth estimate toward VLM direction, fall back to robot pos.
+                            _dir_v = percept.get("direction", "center")
+                            _tgt_v = _estimate_target_pos(env.get_depth(), _dir_v, robot_pos, R)
+                            nav_state["target_pos"]    = _tgt_v.tolist() if _tgt_v is not None else robot_pos.tolist()
+                            nav_state["current_skill"] = "verify_arrival"
+                            _log(f"  [BRAIN-VERIFY step={step}] depth-only \u2192 verify_arrival")
 
                 # \u2500\u2500 Room-step budget: escape if same WRONG room for 6 VLM calls \u2500\u2500
                 _ROOM_VLM_BUDGET = 6
@@ -1120,7 +1130,7 @@ def run_task(
             if _bvp is not None:
                 _bvd = float(np.sqrt(
                     (robot_pos[0] - _bvp[0])**2 + (robot_pos[2] - _bvp[2])**2))
-                if _bvd < 1.5:
+                if _bvd < 3.0:
                     _log(f"  [VALUE-STOP step={step}] dist_to_best_cell={_bvd:.2f}m CLIP={_clip_sc_vm:.2f} room={_cur_room_vm} → done")
                     nav_state["done"] = True
                     if on_thought:

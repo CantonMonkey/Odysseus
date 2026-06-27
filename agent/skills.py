@@ -17,7 +17,7 @@ try:
 except ImportError:
     _HAS_QUATERNION = False
 
-ARRIVE_DIST  = 2.0   # goal-reached threshold (m)
+ARRIVE_DIST  = 3.0   # goal-reached threshold (m); aligned with eval SUCCESS_DIST=3m
 ALIGN_THRESH = 12.0  # heading alignment threshold before moving forward (deg)
 WP_REACH     = 0.4   # waypoint-reached threshold (m)
 
@@ -125,7 +125,7 @@ def follow_path(env, nav_state: dict) -> dict:
         # If robot is close enough for visual confirmation, try verify_arrival
         # before blacklisting. Depth estimates often land inside furniture (unreachable)
         # but the robot is visually adjacent.
-        VERIFY_ACCEPT_DIST = 2.5
+        VERIFY_ACCEPT_DIST = 3.5
         if tgt and dist <= VERIFY_ACCEPT_DIST and not nav_state.get("follow_tried_verify"):
             print(f"  [FOLLOW step={step}] stagnant dist={dist:.2f}m ≤ {VERIFY_ACCEPT_DIST}m → try verify_arrival", flush=True)
             nav_state["current_skill"]      = "verify_arrival"
@@ -246,10 +246,9 @@ def verify_arrival(env, nav_state: dict) -> dict:
     instances      = nav_state.get("target_instances", [])
     _conf = float(percept.get("confidence", 0.0))
 
-    # Accept up to 2.5m on entry: follow_path hands off at 1.2m but a final
-    # forward step can overshoot slightly, causing immediate dist > ARRIVE_DIST
-    # bounce → follow_path stagnation → explore (2-step false escape).
-    VERIFY_ACCEPT_DIST = 2.5
+    # Accept up to 3.5m on entry: aligned with eval SUCCESS_DIST=3m; also ensures
+    # depth-estimated targets (default 3.0m) always pass this gate.
+    VERIFY_ACCEPT_DIST = 3.5
     if dist <= VERIFY_ACCEPT_DIST:
         # Instant success: CLIP already very high at entry → no scan needed.
         _entry_clip = float(nav_state.get("last_clip", {}).get("score", 0.0))
