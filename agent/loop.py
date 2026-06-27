@@ -977,9 +977,12 @@ def run_task(
                         nav_state["current_skill"] = "verify_arrival"
                         _log(f"  [BRAIN-VERIFY step={step}] dist={_vd4:.2f}m \u2192 verify_arrival")
                     elif not instances:
-                        # No GT: robot position is not a reliable target.
-                        # Skip verify_arrival; let value-map exploration continue.
-                        _log(f"  [BRAIN-VERIFY step={step}] depth-only \u2192 skip (no GT instances)")
+                        # No GT: use depth estimate toward VLM direction, fall back to robot pos.
+                        _dir_v = percept.get("direction", "center")
+                        _tgt_v = _estimate_target_pos(env.get_depth(), _dir_v, robot_pos, R)
+                        nav_state["target_pos"]    = _tgt_v.tolist() if _tgt_v is not None else robot_pos.tolist()
+                        nav_state["current_skill"] = "verify_arrival"
+                        _log(f"  [BRAIN-VERIFY step={step}] depth-only \u2192 verify_arrival")
 
                 # \u2500\u2500 Room-step budget: escape if same WRONG room for 6 VLM calls \u2500\u2500
                 _ROOM_VLM_BUDGET = 6

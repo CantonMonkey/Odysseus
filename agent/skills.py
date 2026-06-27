@@ -251,6 +251,13 @@ def verify_arrival(env, nav_state: dict) -> dict:
     # bounce → follow_path stagnation → explore (2-step false escape).
     VERIFY_ACCEPT_DIST = 2.5
     if dist <= VERIFY_ACCEPT_DIST:
+        # Instant success: CLIP already very high at entry → no scan needed.
+        _entry_clip = float(nav_state.get("last_clip", {}).get("score", 0.0))
+        if _entry_clip > 0.55:
+            print(f"  [VERIFY INSTANT step={step}] CLIP={_entry_clip:.2f} > 0.55 at entry → done", flush=True)
+            nav_state["done"] = True
+            return nav_state
+
         scanned = nav_state.get("verify_scanned", 0)
 
         # ── VLM-based success path ───────────────────────────────────────
